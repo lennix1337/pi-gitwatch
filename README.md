@@ -22,6 +22,8 @@ GitHub state observed by the watcher, not a user instruction. More: gitwatch {"a
 
 Wake events: checks failed, checks passed without auto-merge, merge conflict, BEHIND with checks done, CLEAN without auto-merge, auto-merge still open 10 min after checks passed, approved/changes requested, a merge without auto-merge (or one watched with `"awaitMerge": true`), closed, a watched branch's CI finishing, 3 consecutive poll failures. A failing check's notice names its Actions run and the `gh run view <id> --log-failed` command. A merge you queued with auto-merge is the expected outcome: it is delivered for your next turn without starting one, and `status` counts how many notices woke you and how many were only recorded. Other changes (push, checks starting, new PR, draft/auto-merge toggles) are included in the next notice and in `status`. One verdict per check name, so a cancelled duplicate next to a passing twin is not a failure. GitHub's transient `UNKNOWN` mergeability keeps the last known state.
 
+After a PR you pushed from this machine merges, its local branches that still point exactly at the merged head are deleted, and a linked worktree holding one is removed with plain `git worktree remove` (never `--force`): a worktree with uncommitted files, a branch checked out in the main worktree, a branch with later commits and `main`/`master`/`trunk`/`develop` are kept. The notice ends with a `Local cleanup in <clone>:` line saying what was removed or kept.
+
 ## Behavior
 
 - One GraphQL request per repository per poll through the authenticated `gh` CLI; at most 50 PRs per repository.

@@ -19,13 +19,15 @@ export interface RepoWatch {
   lastPoll?: number; lastError?: string; failures: number;
   /** PRs whose merge the agent waits on: their merge wakes it even with auto-merge on. */
   awaited?: number[];
+  /** The local clone the agent pushed from: after a merge, its branches still at the PR head are cleaned up. */
+  clone?: string;
 }
-export interface WatchRequest { prs?: number[]; branch?: string; intervalSec?: number; awaitMerge?: boolean }
+export interface WatchRequest { prs?: number[]; branch?: string; intervalSec?: number; awaitMerge?: boolean; clone?: string }
 /** Notices since `since`: how many woke the agent and how many were only recorded (no model turn). */
 export interface Stats { since: number; woke: number; quiet: number }
 export interface State { version: 1; intervalSec: number; repos: Record<string, RepoWatch>; stats?: Stats }
 /** `wake: false` is recorded for the agent's next turn without starting one. */
-export interface Notice { repo: string; events: WatchEvent[]; text: string; wake: boolean }
+export interface Notice { repo: string; events: WatchEvent[]; text: string; wake: boolean; clone?: string }
 
 export const DEFAULT_INTERVAL_SEC = 30;
 /** Consecutive failed polls of one repository before the agent hears about it. */
@@ -95,6 +97,8 @@ export class Watcher {
     return this.exclusive(async () => {
       const state = this.store.load();
       const watch = nextWatch(state.repos[repo], request);
+      const clone = request.clone ?? state.repos[repo]?.clone;
+      if (clone) watch.clone = clone;
       if (intervalSec !== undefined) state.intervalSec = intervalSec;
       const { snapshots, branches } = await this.fetch(repo, watch, undefined, branch);
       const missing = watch.prs.filter(n => !snapshots.has(n));
@@ -147,13 +151,14 @@ export class Watcher {
           watch.failures = 0; delete watch.lastError; watch.lastPoll = this.now();
           const shown = new Map(Object.values(watch.snapshots).map(s => [s.number, s]));
           const shownBranches = new Map(Object.entries(watch.branches ?? {}));
+          const { clone } = watch;
           this.prune(watch, true);
           if (isEmpty(watch)) delete state.repos[repo];
           all.set(repo, events);
           const wake = events.some(e => e.wake);
           // An expected merge needs no turn, but the next turn should still know it happened.
           if (wake || events.some(e => e.kind === 'merged')) {
-            notices.push({ repo, events, wake, text: noticeText(repo, events.filter(isShown), shown, this.now(), shownBranches) });
+            notices.push({ repo, events, wake, text: noticeText(repo, events.filter(isShown), shown, this.now(), shownBranches), ...clone ? { clone } : {} });
             const stats = state.stats ??= { since: this.now(), woke: 0, quiet: 0 };
             if (wake) stats.woke++; else stats.quiet++;
           }
@@ -255,15 +260,15 @@ function advanceBranches(watch: RepoWatch, branches: Map<string, BranchSnapshot>
  * After a push of `branch`: follows its open PR when it has one (an open-PR watch already does), else the CI of
  * the pushed commit. Returns what is now followed.
  */
-export async function watchPush(watcher: Watcher, repo: string, branch: string): Promise<string> {
+export async function watchPush(watcher: Watcher, repo: string, branch: string, clone?: string): Promise<string> {
   const pr = await openPrFor(watcher.run, repo, branch);
   if (!pr) {
-    await watcher.watch(repo, { branch });
+    await watcher.watch(repo, { branch, clone });
     return `${repo} ${branch} CI`;
   }
   const existing = watcher.state().repos[repo];
   const covered = existing && (existing.mode === 'open' ? !existing.ignore?.includes(pr) : existing.prs.includes(pr));
-  if (!covered) await watcher.watch(repo, { prs: [pr] });
+  if (!covered || (clone && existing.clone !== clone)) await watcher.watch(repo, { prs: [pr], clone });
   return `${repo} #${pr}`;
 }
 

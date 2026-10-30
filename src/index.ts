@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import { createdPrs, gitRunner, pushes, resolvePush, type GitRunner } from './autowatch.ts';
+import { cleanupNote } from './cleanup.ts';
 import { BRANCH, ghRunner, MAX_PRS, REPO, type Runner } from './github.ts';
 import { statusText, Store, Watcher, watchPush, type Notice } from './watcher.ts';
 
@@ -48,7 +49,7 @@ export async function autoWatch(watcher: Watcher, git: GitRunner, command: strin
   for (const push of pushes(command, cwd)) {
     try {
       const target = await resolvePush(push, git);
-      if (target) followed.add(await watchPush(watcher, target.repo, target.branch));
+      if (target) followed.add(await watchPush(watcher, target.repo, target.branch, target.clone));
     } catch (e) { failed.push(`push in ${push.dir}: ${(e as Error).message.split('\n')[0]}`); }
   }
   const lines = [];
@@ -82,6 +83,7 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
     try {
       if (Object.keys(state.repos).length && lease.acquire(now(), interval * 3)) {
         const { notices } = await watcher.poll();
+        for (const n of notices) n.text += await cleanupNote(git, n);
         if (running) for (const n of notices) deliver(n);
       }
     } catch { /* a failed poll is counted per repository and reported by the watcher */ }
