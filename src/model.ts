@@ -19,7 +19,8 @@ export interface Snapshot {
 export interface BranchSnapshot { branch: string; head: string; headline: string; checks: Checks; reported: boolean }
 export type EventKind = 'opened' | 'merged' | 'closed' | 'reopened' | 'push' | 'checks' | 'mergeState' | 'review' | 'ready' | 'draft' | 'stall';
 /** `pr` is 0 for branch and watcher events; `branch` names the branch of a branch event. */
-export interface WatchEvent { pr: number; branch?: string; kind: EventKind; text: string; wake: boolean }
+/** `head` is the merged commit of a `merged` event's PR head, so local branches still pointing at it can be cleaned. */
+export interface WatchEvent { pr: number; branch?: string; kind: EventKind; text: string; wake: boolean; head?: string }
 
 interface RawContext {
   __typename?: string; name?: string; status?: string; conclusion?: string | null; context?: string; state?: string;
@@ -100,7 +101,7 @@ export function diff(prev: Snapshot | undefined, cur: Snapshot, awaited = false)
   const pr = cur.number;
   if (!prev) return [{ pr, kind: 'opened', text: `opened by ${cur.author}`, wake: false }];
   if (cur.state !== prev.state) {
-    if (cur.state === 'MERGED') return [{ pr, kind: 'merged', text: `merged${cur.mergeCommit ? ` ${cur.mergeCommit}` : ''}`, wake: awaited || !prev.auto }];
+    if (cur.state === 'MERGED') return [{ pr, kind: 'merged', text: `merged${cur.mergeCommit ? ` ${cur.mergeCommit}` : ''}`, wake: awaited || !prev.auto, head: cur.head }];
     if (cur.state === 'CLOSED') return [{ pr, kind: 'closed', text: 'closed without merge', wake: true }];
     return [{ pr, kind: 'reopened', text: 'reopened', wake: true }];
   }

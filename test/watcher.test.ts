@@ -147,3 +147,16 @@ test('an expected merge alone makes a quiet notice and is counted as needing no 
   assert.deepEqual([watcher.state().stats?.woke, watcher.state().stats?.quiet], [0, 1]);
   assert.match(statusText({ ...watcher.state(), repos: { 'o/r': { mode: 'open', prs: [], snapshots: {}, failures: 0 } } }, new Map(), undefined, 0), /0 notices woke you, 1 expected merges were only recorded \(no turn\)/);
 });
+
+test('the clone a push came from rides on the merge notice with the merged head, even into an existing open watch', async () => {
+  const { gh, watcher } = setup();
+  gh.set(pr(5, { autoMergeRequest: {} }, [['test', 'IN_PROGRESS']]));
+  gh.heads.set('feat/x', 5);
+  await watcher.watch('o/r');
+  await watchPush(watcher, 'o/r', 'feat/x', 'C:/projetos/r');
+  assert.equal(watcher.state().repos['o/r'].clone, 'C:/projetos/r');
+  gh.set(pr(5, { state: 'MERGED', autoMergeRequest: {}, mergeCommit: { oid: 'eeeeee123456' } }));
+  const { notices } = await watcher.poll();
+  assert.equal(notices[0].clone, 'C:/projetos/r');
+  assert.deepEqual(notices[0].events.filter(e => e.kind === 'merged').map(e => e.head), ['5aaaaaaa'], 'the short head a snapshot keeps; git resolves it');
+});

@@ -78,10 +78,11 @@ function gitPush(words: string[], dir: string): Push | undefined {
 }
 
 /** Resolves a push to `owner/name` and branch through the local repository; undefined when it is not a GitHub branch push. */
-export async function resolvePush(push: Push, git: GitRunner): Promise<{ repo: string; branch: string } | undefined> {
+export async function resolvePush(push: Push, git: GitRunner): Promise<{ repo: string; branch: string; clone?: string } | undefined> {
   const url = /^(https?:|git@|ssh:)/.test(push.remote) ? push.remote : await git(['remote', 'get-url', push.remote], push.dir);
   const repo = githubRepo(url);
   const branch = push.branch ?? await git(['rev-parse', '--abbrev-ref', 'HEAD'], push.dir);
   if (!repo || !branch || branch === 'HEAD' || !BRANCH.test(branch)) return undefined;
-  return { repo, branch };
+  const clone = await git(['rev-parse', '--show-toplevel'], push.dir).catch(() => '');
+  return { repo, branch, ...clone ? { clone } : {} };
 }

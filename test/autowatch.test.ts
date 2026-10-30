@@ -24,9 +24,9 @@ test('tags, deletions, dry runs and non-push git commands are ignored', () => {
 
 test('a push resolves to a GitHub repository and branch through git', async () => {
   const calls: string[][] = [];
-  const git = async (args: string[]) => { calls.push(args); return args[0] === 'remote' ? 'git@github.com:lennix1337/dotfiles.git' : 'main'; };
-  assert.deepEqual(await resolvePush({ dir: '/w', remote: 'origin' }, git), { repo: 'lennix1337/dotfiles', branch: 'main' });
-  assert.deepEqual(calls, [['remote', 'get-url', 'origin'], ['rev-parse', '--abbrev-ref', 'HEAD']]);
+  const git = async (args: string[]) => { calls.push(args); return args[0] === 'remote' ? 'git@github.com:lennix1337/dotfiles.git' : args[1] === '--show-toplevel' ? 'C:/w' : 'main'; };
+  assert.deepEqual(await resolvePush({ dir: '/w', remote: 'origin' }, git), { repo: 'lennix1337/dotfiles', branch: 'main', clone: 'C:/w' });
+  assert.deepEqual(calls, [['remote', 'get-url', 'origin'], ['rev-parse', '--abbrev-ref', 'HEAD'], ['rev-parse', '--show-toplevel']]);
   const other = async () => 'https://gitlab.com/a/b.git';
   assert.equal(await resolvePush({ dir: '/w', remote: 'origin', branch: 'main' }, other), undefined, 'another host is not followed');
   assert.equal(githubRepo('https://github.com/o/r.git'), 'o/r');
