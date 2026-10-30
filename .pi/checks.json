@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "checks": {
+    "typecheck": { "argv": ["node", "node_modules/typescript/bin/tsc", "--noEmit"], "timeoutMs": 60000, "description": "TypeScript preflight for the extension and tests" },
+    "unit": { "argv": ["node", "--import", "tsx", "--test", "test/model.test.ts", "test/watcher.test.ts", "test/extension.test.ts"], "timeoutMs": 60000, "description": "Offline: check summaries, transitions, store, lease and the Pi tool/notice boundary with a fake gh" }
+  }
+}
