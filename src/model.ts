@@ -91,12 +91,16 @@ const MERGE_STATE_TEXT: Record<string, string> = {
   BLOCKED: 'blocked by required checks or reviews (BLOCKED)', UNSTABLE: 'mergeable with non-required failures (UNSTABLE)',
 };
 
-/** The transitions from `prev` to `cur`. `wake` marks those the agent must act on; the rest ride along in the same notice. */
-export function diff(prev: Snapshot | undefined, cur: Snapshot): WatchEvent[] {
+/**
+ * The transitions from `prev` to `cur`. `wake` marks those the agent must act on; the rest ride along in the same notice.
+ * A merge the agent arranged (auto-merge was on) is the expected outcome: it is recorded without a turn, unless the agent
+ * said it is `awaited` (work waits on it).
+ */
+export function diff(prev: Snapshot | undefined, cur: Snapshot, awaited = false): WatchEvent[] {
   const pr = cur.number;
   if (!prev) return [{ pr, kind: 'opened', text: `opened by ${cur.author}`, wake: false }];
   if (cur.state !== prev.state) {
-    if (cur.state === 'MERGED') return [{ pr, kind: 'merged', text: `merged${cur.mergeCommit ? ` ${cur.mergeCommit}` : ''}`, wake: true }];
+    if (cur.state === 'MERGED') return [{ pr, kind: 'merged', text: `merged${cur.mergeCommit ? ` ${cur.mergeCommit}` : ''}`, wake: awaited || !prev.auto }];
     if (cur.state === 'CLOSED') return [{ pr, kind: 'closed', text: 'closed without merge', wake: true }];
     return [{ pr, kind: 'reopened', text: 'reopened', wake: true }];
   }

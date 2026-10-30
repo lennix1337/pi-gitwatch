@@ -106,3 +106,21 @@ test('a successful push or gh pr create in bash starts a watch and says so in th
   const child = harness('json');
   assert.equal(await child.handlers.get('tool_result')!({ toolName: 'bash', input: { command: 'git push' }, content: [], isError: false }, { mode: 'json' }), undefined, 'a non-polling session never watches');
 });
+
+test('a merge queued with auto-merge is recorded for the next turn without waking; an awaited one wakes', async () => {
+  const h = harness();
+  h.gh.set(pr(31, { autoMergeRequest: {} }, [['test', 'IN_PROGRESS']]), pr(32, { autoMergeRequest: {} }, [['test', 'IN_PROGRESS']]));
+  await h.call({ action: 'watch', repo: 'o/r', prs: [31] });
+  await h.call({ action: 'watch', repo: 'o/r', prs: [32], awaitMerge: true });
+  h.gh.set(pr(31, { state: 'MERGED', autoMergeRequest: {}, mergeCommit: { oid: 'cf5d0007aaaa' } }));
+  await h.fire();
+  assert.equal(h.sent.length, 1);
+  assert.match(h.sent[0].message.content, /#31 merged cf5d0007/);
+  assert.deepEqual(h.sent[0].options, { deliverAs: 'nextTurn' }, 'no model turn for the expected outcome');
+  h.gh.set(pr(32, { state: 'MERGED', autoMergeRequest: {}, mergeCommit: { oid: 'dddd0000aaaa' } }));
+  await h.fire();
+  assert.deepEqual(h.sent[1].options, { triggerTurn: true, deliverAs: 'steer' }, 'work waits on #32: it wakes');
+  const status = await h.call({ action: 'status' });
+  assert.match(status.content[0].text, /No repositories watched/);
+  assert.equal((await h.call({ action: 'watch', repo: 'o/r', awaitMerge: true })).isError, true, 'awaitMerge needs prs');
+});

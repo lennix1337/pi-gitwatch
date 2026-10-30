@@ -68,9 +68,10 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
   let timer: unknown;
   let running = false;
 
+  // A notice that needs the agent wakes it; an expected merge only waits for its next turn (no model call).
   const deliver = (notice: Notice) => pi.sendMessage(
     { customType: MESSAGE_TYPE, content: notice.text, display: true, details: { repo: notice.repo, events: notice.events } },
-    { triggerTurn: true, deliverAs: 'steer' },
+    notice.wake ? { triggerTurn: true, deliverAs: 'steer' } : { deliverAs: 'nextTurn' },
   );
 
   const tick = async () => {
@@ -99,20 +100,22 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
 
   pi.registerTool({
     name: 'gitwatch', label: 'Watch GitHub PRs',
-    description: 'Watch GitHub pull requests and branch CI and get woken when they need you: checks failed or finished (without auto-merge), merge conflict, ready to merge, auto-merge stuck, review decision, merged or closed. The notice arrives as a "[gitwatch] owner/repo" message between tool calls or as a new turn; never poll or sleep for it. A successful `gh pr create` or `git push` in bash is followed automatically (the output says so). watch adds a repository (all open PRs, including new ones), only "prs", or a "branch" whose latest commit\'s CI is followed until it finishes; merged/closed PRs are reported once, then dropped. status (default) refreshes now and shows one line per PR or branch with its next step. unwatch removes PRs, a branch or the repository. Read-only on GitHub: you merge, fix and push yourself.',
+    description: 'Watch GitHub pull requests and branch CI and get woken when they need you: checks failed or finished (without auto-merge), merge conflict, ready to merge, auto-merge stuck, review decision, merged (an auto-merge you queued is only recorded for your next turn; add awaitMerge with prs when work waits on it) or closed. The notice arrives as a "[gitwatch] owner/repo" message between tool calls or as a new turn; never poll or sleep for it. A successful `gh pr create` or `git push` in bash is followed automatically (the output says so). watch adds a repository (all open PRs, including new ones), only "prs", or a "branch" whose latest commit\'s CI is followed until it finishes; merged/closed PRs are reported once, then dropped. status (default) refreshes now and shows one line per PR or branch with its next step. unwatch removes PRs, a branch or the repository. Read-only on GitHub: you merge, fix and push yourself.',
     parameters: Type.Object({
       action: Type.Optional(Type.Unsafe<typeof actions[number]>({ type: 'string', enum: actions, description: 'Default status.' })),
       repo: Type.Optional(Type.String({ pattern: REPO.source, description: 'owner/name; required for watch/unwatch, filters status.' })),
       prs: Type.Optional(Type.Array(Type.Integer({ minimum: 1 }), { minItems: 1, maxItems: MAX_PRS, description: 'Only these PRs; omit for every open PR.' })),
       branch: Type.Optional(Type.String({ pattern: BRANCH.source, description: 'Follow the CI of this branch\'s latest commit (a direct push) until it finishes.' })),
       intervalSec: Type.Optional(Type.Integer({ minimum: 10, maximum: 600, description: 'Poll interval for all watches, default 30.' })),
+      awaitMerge: Type.Optional(Type.Boolean({ description: 'With prs: wake me when they merge even under auto-merge (work waits on it).' })),
     }, { additionalProperties: false }),
     async execute(_id, params, signal) {
       const action = params.action ?? 'status';
       try {
         validate(action, params);
+        validateAwait(action, params);
         if (action === 'watch') {
-          await watcher.watch(params.repo!, { prs: params.prs, branch: params.branch, intervalSec: params.intervalSec });
+          await watcher.watch(params.repo!, { prs: params.prs, branch: params.branch, intervalSec: params.intervalSec, awaitMerge: params.awaitMerge });
           start();
           return reply(statusText(watcher.state(), new Map(), params.repo, now()));
         }
@@ -137,7 +140,7 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
 
 const reply = (text: string) => ({ content: [{ type: 'text' as const, text }], details: {} });
 
-interface Params { action?: string; repo?: string; prs?: number[]; branch?: string; intervalSec?: number }
+interface Params { action?: string; repo?: string; prs?: number[]; branch?: string; intervalSec?: number; awaitMerge?: boolean }
 
 /** Rejects a call before any GitHub request, with the corrective hint. */
 function validate(action: string, params: Params) {
@@ -148,6 +151,10 @@ function validate(action: string, params: Params) {
   if (action === 'unwatch' && params.intervalSec !== undefined) throw new Error('unwatch accepts repo, prs or branch only.');
   if (params.branch !== undefined && !BRANCH.test(params.branch)) throw new Error('branch must be a branch name such as main or feat/x.');
   if (params.branch !== undefined && params.prs) throw new Error('pass prs or branch, not both.');
+}
+
+function validateAwait(action: string, params: Params) {
+  if (params.awaitMerge !== undefined && (action !== 'watch' || !params.prs)) throw new Error('awaitMerge goes with watch and prs: the PRs whose merge you wait on.');
 }
 
 interface BashResult { toolName: string; isError: boolean; input: Record<string, unknown>; content: ({ type: 'text'; text: string } | { type: 'image' })[] }

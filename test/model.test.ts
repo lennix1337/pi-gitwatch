@@ -99,3 +99,12 @@ test('branch CI: a finished baseline is silent; a new commit wakes once when its
   assert.match(branchLine(failed.snapshot), /^main @b2000000 · checks fail 0✓ 1✗ 0… \[test\] · CI finished, watch ends · "commit b2"$/);
   assert.deepEqual(branchDiff(failed.snapshot, normalizeBranch('main', commit('b2', [['test', 'COMPLETED', 'FAILURE']]))).events, []);
 });
+
+test('a merge wakes unless auto-merge was queued for it; an awaited merge always wakes', () => {
+  const queued = normalize(pr(31, { autoMergeRequest: {} }));
+  const merged = normalize(pr(31, { state: 'MERGED', autoMergeRequest: {}, mergeCommit: { oid: 'cf5d0007aaaa' } }));
+  assert.equal(diff(queued, merged)[0]!.wake, false, 'the expected outcome of auto-merge');
+  assert.equal(diff(queued, merged, true)[0]!.wake, true, 'awaited');
+  assert.equal(diff(normalize(pr(31)), merged)[0]!.wake, true, 'merged by someone, without auto-merge');
+  assert.equal(diff(queued, normalize(pr(31, { state: 'CLOSED' })))[0]!.wake, true, 'a close is never expected');
+});

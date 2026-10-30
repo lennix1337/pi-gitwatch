@@ -123,3 +123,27 @@ test('auto-merge PRs stay quiet when checks pass and wake once if they do not me
   assert.equal(woken.length, 1);
   assert.match(woken[0].text, /#6 auto-merge has not merged 10 min after checks passed \(BLOCKED\)[\s\S]*next: auto-merge is waiting/);
 });
+
+test('quiet and woken notices are counted, so the share of events that needed no model turn is measurable', async () => {
+  const { gh, watcher } = setup();
+  gh.set(pr(1, { autoMergeRequest: {} }, [['test', 'IN_PROGRESS']]), pr(2, {}, [['test', 'IN_PROGRESS']]));
+  await watcher.watch('o/r', { prs: [1, 2] });
+  gh.set(pr(1, { state: 'MERGED', autoMergeRequest: {}, mergeCommit: { oid: 'abcdef123456' } }), pr(2, {}, [['test', 'COMPLETED', 'FAILURE']]));
+  const { notices } = await watcher.poll();
+  assert.deepEqual(notices.map(n => n.wake), [true], 'one repository, one notice: the failure wakes, the merge rides along');
+  gh.set(pr(2, { state: 'MERGED', autoMergeRequest: {}, mergeCommit: { oid: 'bbbbbb123456' } }));
+  assert.deepEqual((await watcher.poll()).notices.map(n => n.wake), [true], '#2 had no auto-merge when last seen');
+  const state = watcher.state();
+  assert.deepEqual([state.stats?.woke, state.stats?.quiet], [2, 0]);
+});
+
+test('an expected merge alone makes a quiet notice and is counted as needing no turn', async () => {
+  const { gh, watcher } = setup();
+  gh.set(pr(5, { autoMergeRequest: {} }, [['test', 'IN_PROGRESS']]));
+  await watcher.watch('o/r', { prs: [5] });
+  gh.set(pr(5, { state: 'MERGED', autoMergeRequest: {}, mergeCommit: { oid: 'eeeeee123456' } }));
+  const { notices } = await watcher.poll();
+  assert.deepEqual(notices.map(n => [n.wake, /#5 merged eeeeee12/.test(n.text)]), [[false, true]]);
+  assert.deepEqual([watcher.state().stats?.woke, watcher.state().stats?.quiet], [0, 1]);
+  assert.match(statusText({ ...watcher.state(), repos: { 'o/r': { mode: 'open', prs: [], snapshots: {}, failures: 0 } } }, new Map(), undefined, 0), /0 notices woke you, 1 expected merges were only recorded \(no turn\)/);
+});

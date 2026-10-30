@@ -17,10 +17,15 @@ export interface RepoWatch {
   /** Branches whose latest commit's CI is followed until it finishes (CI of a direct push). */
   branches?: Record<string, BranchSnapshot>;
   lastPoll?: number; lastError?: string; failures: number;
+  /** PRs whose merge the agent waits on: their merge wakes it even with auto-merge on. */
+  awaited?: number[];
 }
-export interface WatchRequest { prs?: number[]; branch?: string; intervalSec?: number }
-export interface State { version: 1; intervalSec: number; repos: Record<string, RepoWatch> }
-export interface Notice { repo: string; events: WatchEvent[]; text: string }
+export interface WatchRequest { prs?: number[]; branch?: string; intervalSec?: number; awaitMerge?: boolean }
+/** Notices since `since`: how many woke the agent and how many were only recorded (no model turn). */
+export interface Stats { since: number; woke: number; quiet: number }
+export interface State { version: 1; intervalSec: number; repos: Record<string, RepoWatch>; stats?: Stats }
+/** `wake: false` is recorded for the agent's next turn without starting one. */
+export interface Notice { repo: string; events: WatchEvent[]; text: string; wake: boolean }
 
 export const DEFAULT_INTERVAL_SEC = 30;
 /** Consecutive failed polls of one repository before the agent hears about it. */
@@ -145,13 +150,19 @@ export class Watcher {
           this.prune(watch, true);
           if (isEmpty(watch)) delete state.repos[repo];
           all.set(repo, events);
-          if (events.some(e => e.wake)) notices.push({ repo, events, text: noticeText(repo, events.filter(isShown), shown, this.now(), shownBranches) });
+          const wake = events.some(e => e.wake);
+          // An expected merge needs no turn, but the next turn should still know it happened.
+          if (wake || events.some(e => e.kind === 'merged')) {
+            notices.push({ repo, events, wake, text: noticeText(repo, events.filter(isShown), shown, this.now(), shownBranches) });
+            const stats = state.stats ??= { since: this.now(), woke: 0, quiet: 0 };
+            if (wake) stats.woke++; else stats.quiet++;
+          }
         } catch (error) {
           if (signal?.aborted) throw error;
           watch.failures++; watch.lastError = error instanceof Error ? error.message : String(error);
           if (watch.failures === FAILURES_BEFORE_NOTICE) {
             const text = `[gitwatch] ${repo} · ${brt(this.now())}\nPolling failed ${watch.failures} times in a row: ${watch.lastError}\nThe watch keeps retrying every ${state.intervalSec}s. Check \`gh auth status\`; stop with gitwatch {"action":"unwatch","repo":"${repo}"}.`;
-            notices.push({ repo, events: [], text });
+            notices.push({ repo, events: [], text, wake: true });
           }
         }
       }
@@ -176,6 +187,7 @@ export class Watcher {
   private prune(watch: RepoWatch, branches = false) {
     for (const [n, s] of Object.entries(watch.snapshots)) if (s.state !== 'OPEN') delete watch.snapshots[n];
     if (watch.mode === 'list') watch.prs = watch.prs.filter(n => watch.snapshots[n]);
+    pruneAwaited(watch);
     if (branches && watch.branches) {
       for (const [name, s] of Object.entries(watch.branches)) if (s.reported) delete watch.branches[name];
       if (!Object.keys(watch.branches).length) delete watch.branches;
@@ -183,8 +195,15 @@ export class Watcher {
   }
 }
 
+/** A merged or closed PR is no longer awaited. */
+function pruneAwaited(watch: RepoWatch) {
+  if (!watch.awaited) return;
+  watch.awaited = watch.awaited.filter(n => watch.snapshots[n]);
+  if (!watch.awaited.length) delete watch.awaited;
+}
+
 /** The watch a request leads to, before GitHub confirms its PRs and branch exist. */
-function nextWatch(existing: RepoWatch | undefined, { prs, branch }: WatchRequest): RepoWatch {
+function nextWatch(existing: RepoWatch | undefined, { prs, branch, awaitMerge }: WatchRequest): RepoWatch {
   const mode = prs?.length || branch ? 'list' : 'open';
   const merged = mode === 'list' && existing?.mode === 'list' ? [...new Set([...existing.prs, ...prs ?? []])] : prs ?? [];
   if (merged.length > MAX_PRS) throw new Error(`At most ${MAX_PRS} PRs per repository.`);
@@ -192,6 +211,8 @@ function nextWatch(existing: RepoWatch | undefined, { prs, branch }: WatchReques
     mode: existing?.mode === 'open' ? 'open' : mode, prs: merged.sort((a, b) => a - b), snapshots: existing?.snapshots ?? {},
     failures: 0, ...existing?.branches ? { branches: existing.branches } : {},
   };
+  const awaited = [...new Set([...existing?.awaited ?? [], ...awaitMerge ? prs ?? [] : []])];
+  if (awaited.length) watch.awaited = awaited;
   const ignore = existing?.ignore?.filter(n => !prs?.includes(n));
   // Watching the whole repository again forgets the PRs unwatched from it; adding PRs or a branch keeps that list.
   if (watch.mode === 'open' && ignore?.length && (prs?.length || branch)) watch.ignore = ignore;
@@ -211,7 +232,7 @@ function advancePrs(watch: RepoWatch, snapshots: Map<number, Snapshot>, open: nu
     if (watch.ignore?.includes(n) || !cur) continue;
     const prev = watch.snapshots[n];
     const { snapshot: next, event: stall } = autoMergeStall(prev, settle(prev, cur), now);
-    if (prev || watch.mode === 'open') events.push(...diff(prev, next), ...stall ? [stall] : []);
+    if (prev || watch.mode === 'open') events.push(...diff(prev, next, watch.awaited?.includes(n)), ...stall ? [stall] : []);
     watch.snapshots[n] = next;
   }
   return events;
@@ -257,8 +278,10 @@ export function statusText(state: State, events: Map<string, WatchEvent[]>, only
   if (!repos.length) return only
     ? `${only} is not watched. Start: gitwatch {"action":"watch","repo":"${only}"} (all open PRs) or add "prs":[123].`
     : 'No repositories watched. Start: gitwatch {"action":"watch","repo":"owner/name"} (all open PRs) or add "prs":[123].';
+  const stats = state.stats && state.stats.woke + state.stats.quiet
+    ? `\nSince ${brt(state.stats.since)}: ${state.stats.woke} notices woke you, ${state.stats.quiet} expected merges were only recorded (no turn).` : '';
   return repos.map(([repo, w]) => repoStatus(repo, w, events.get(repo) ?? [])).join('\n\n')
-    + `\nEvery ${state.intervalSec}s the watcher wakes you on failed or finished checks, conflicts, merges and closes, and when a watched branch's CI finishes.`;
+    + `\nEvery ${state.intervalSec}s the watcher wakes you on failed or finished checks, conflicts, unexpected merges and closes, and when a watched branch's CI finishes; a merge you queued with auto-merge is recorded for your next turn instead, unless you watched it with "awaitMerge":true.${stats}`;
 }
 
 /** One repository's status: totals, poll health, changes this refresh found, then a line per PR and branch. */
