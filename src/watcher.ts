@@ -23,9 +23,10 @@ export interface RepoWatch {
   clone?: string;
 }
 export interface WatchRequest { prs?: number[]; branch?: string; intervalSec?: number; awaitMerge?: boolean; clone?: string }
-/** Notices since `since`: how many woke the agent and how many were only recorded (no model turn). */
+/** Routing decisions, including tool status refreshes; not evidence of host delivery or model execution. */
 export interface Stats { since: number; woke: number; quiet: number }
-export interface State { version: 1; intervalSec: number; repos: Record<string, RepoWatch>; stats?: Stats }
+export interface DeliveryStats { since: number; wakeAccepted: number; quietAccepted: number; uncertain: number }
+export interface State { version: 1; intervalSec: number; repos: Record<string, RepoWatch>; stats?: Stats; deliveries?: DeliveryStats }
 /** `wake: false` is recorded for the agent's next turn without starting one. */
 export interface Notice { repo: string; events: WatchEvent[]; text: string; wake: boolean; clone?: string }
 
@@ -87,6 +88,18 @@ export class Watcher {
   }
 
   state() { return this.store.load(); }
+
+  /** Only the host dispatch boundary calls this; rejected sends may have taken effect, so never retry them. */
+  recordDelivery(wake: boolean, accepted: boolean): Promise<void> {
+    return this.exclusive(async () => {
+      const state = this.store.load();
+      const delivery = state.deliveries ??= { since: this.now(), wakeAccepted: 0, quietAccepted: 0, uncertain: 0 };
+      if (!accepted) delivery.uncertain++;
+      else if (wake) delivery.wakeAccepted++;
+      else delivery.quietAccepted++;
+      this.store.save(state);
+    });
+  }
 
   /**
    * Without `prs` or `branch`, follows every open PR; with `prs`, adds those; with `branch`, follows the CI of that
@@ -280,13 +293,22 @@ const isShown = (e: WatchEvent) => e.pr !== 0 || e.branch !== undefined;
 /** The status the tool returns: aggregates first, then one line per PR with its next step. */
 export function statusText(state: State, events: Map<string, WatchEvent[]>, only: string | undefined, now: number): string {
   const repos = Object.entries(state.repos).filter(([repo]) => !only || repo === only);
-  if (!repos.length) return only
+  const stats = deliveryText(state);
+  if (!repos.length) return (only
     ? `${only} is not watched. Start: gitwatch {"action":"watch","repo":"${only}"} (all open PRs) or add "prs":[123].`
-    : 'No repositories watched. Start: gitwatch {"action":"watch","repo":"owner/name"} (all open PRs) or add "prs":[123].';
-  const stats = state.stats && state.stats.woke + state.stats.quiet
-    ? `\nSince ${brt(state.stats.since)}: ${state.stats.woke} notices woke you, ${state.stats.quiet} expected merges were only recorded (no turn).` : '';
+    : 'No repositories watched. Start: gitwatch {"action":"watch","repo":"owner/name"} (all open PRs) or add "prs":[123].') + stats;
   return repos.map(([repo, w]) => repoStatus(repo, w, events.get(repo) ?? [])).join('\n\n')
-    + `\nEvery ${state.intervalSec}s the watcher wakes you on failed or finished checks, conflicts, unexpected merges and closes, and when a watched branch's CI finishes; a merge you queued with auto-merge is recorded for your next turn instead, unless you watched it with "awaitMerge":true.${stats}`;
+    + `\nEvery ${state.intervalSec}s the watcher requests a turn on failed or finished checks, conflicts, unexpected merges and closes, and when a watched branch's CI finishes; a merge you queued with auto-merge is sent for your next turn instead, unless you watched it with "awaitMerge":true.${stats}`;
+}
+
+/** Lifetime counters across all repositories; no historical routing count is upgraded to delivery evidence. */
+const sinceText = (at: number) => new Date(at).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+function deliveryText(state: State): string {
+  const planned = state.stats;
+  const routing = planned ? `\nRouting decisions (all repos) since ${sinceText(planned.since)}: ${planned.woke} wake, ${planned.quiet} next-turn; not delivery evidence.` : '';
+  const d = state.deliveries;
+  if (!d) return routing + '\nHost delivery: not measured yet; model runs and saved turns unknown.';
+  return routing + `\nDelivery evidence (all repos) since ${sinceText(d.since)}. Host accepted: ${d.wakeAccepted} wake requests, ${d.quietAccepted} next-turn notices; ${d.uncertain} uncertain (no automatic replay). These are not model runs or saved turns.`;
 }
 
 /** One repository's status: totals, poll health, changes this refresh found, then a line per PR and branch. */
