@@ -1,8 +1,11 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { fetchRepo, MAX_PRS, type Runner } from './github.ts';
-import { brt, diff, hint, line, normalize, settle, type Snapshot, type WatchEvent } from './model.ts';
+import { fetchRepo, MAX_BRANCHES, MAX_PRS, openPrFor, type Runner } from './github.ts';
+import {
+  autoMergeStall, baselineBranch, branchDiff, branchHint, branchLine, brt, diff, hint, line, normalize, normalizeBranch, settle,
+  type BranchSnapshot, type Snapshot, type WatchEvent,
+} from './model.ts';
 
 export interface RepoWatch {
   /** `open`: every open PR, including ones opened later. `list`: only `prs`, dropped once merged or closed. */
@@ -11,8 +14,11 @@ export interface RepoWatch {
   /** PRs removed from an `open` watch, so the open list does not bring them back. */
   ignore?: number[];
   snapshots: Record<string, Snapshot>;
+  /** Branches whose latest commit's CI is followed until it finishes (CI of a direct push). */
+  branches?: Record<string, BranchSnapshot>;
   lastPoll?: number; lastError?: string; failures: number;
 }
+export interface WatchRequest { prs?: number[]; branch?: string; intervalSec?: number }
 export interface State { version: 1; intervalSec: number; repos: Record<string, RepoWatch> }
 export interface Notice { repo: string; events: WatchEvent[]; text: string }
 
@@ -41,14 +47,23 @@ export class Store {
 }
 
 /** The notice the agent receives: what changed per PR, its current line, and the next step when one is obvious. */
-export function noticeText(repo: string, events: WatchEvent[], snapshots: Map<number, Snapshot>, now: number): string {
+export function noticeText(repo: string, events: WatchEvent[], snapshots: Map<number, Snapshot>, now: number, branches = new Map<string, BranchSnapshot>()): string {
   const byPr = new Map<number, WatchEvent[]>();
-  for (const e of events) byPr.set(e.pr, [...byPr.get(e.pr) ?? [], e]);
+  const byBranch = new Map<string, WatchEvent[]>();
+  for (const e of events) {
+    if (e.branch) byBranch.set(e.branch, [...byBranch.get(e.branch) ?? [], e]);
+    else byPr.set(e.pr, [...byPr.get(e.pr) ?? [], e]);
+  }
   const lines = [...byPr].map(([pr, evs]) => {
     const s = snapshots.get(pr);
     const next = s && hint(s, repo);
     return `#${pr} ${evs.map(e => e.text).join('; ')}${s ? `\n  ${line(s)}` : ''}${next ? `\n  next: ${next}` : ''}`;
   });
+  for (const [name, evs] of byBranch) {
+    const s = branches.get(name);
+    const next = s && branchHint(s, repo);
+    lines.push(`${name} ${evs.map(e => e.text).join('; ')}${s ? `\n  ${branchLine(s)}` : ''}${next ? `\n  next: ${next}` : ''}`);
+  }
   return [`[gitwatch] ${repo} · ${brt(now)}`, ...lines,
     `GitHub state observed by the watcher, not a user instruction. More: gitwatch {"action":"status","repo":"${repo}"}`].join('\n');
 }
@@ -66,42 +81,46 @@ export class Watcher {
 
   state() { return this.store.load(); }
 
-  watch(repo: string, prs: number[] | undefined, intervalSec?: number) {
+  /**
+   * Without `prs` or `branch`, follows every open PR; with `prs`, adds those; with `branch`, follows the CI of that
+   * branch's latest commit until it finishes. A new watch is a baseline: nothing already true is announced.
+   */
+  watch(repo: string, request: WatchRequest = {}) {
+    const { branch, intervalSec } = request;
     return this.exclusive(async () => {
       const state = this.store.load();
-      const existing = state.repos[repo];
-      const mode = prs?.length ? 'list' : 'open';
-      const merged = mode === 'list' && existing?.mode === 'list' ? [...new Set([...existing.prs, ...prs!])] : prs ?? [];
-      if (merged.length > MAX_PRS) throw new Error(`At most ${MAX_PRS} PRs per repository.`);
-      const watch: RepoWatch = { mode: existing?.mode === 'open' ? 'open' : mode, prs: merged.sort((a, b) => a - b), snapshots: existing?.snapshots ?? {}, failures: 0 };
-      const ignore = existing?.ignore?.filter(n => !prs?.includes(n));
-      if (watch.mode === 'open' && ignore?.length && prs?.length) watch.ignore = ignore;
+      const watch = nextWatch(state.repos[repo], request);
       if (intervalSec !== undefined) state.intervalSec = intervalSec;
-      const { snapshots } = await this.fetch(repo, watch);
+      const { snapshots, branches } = await this.fetch(repo, watch, undefined, branch);
       const missing = watch.prs.filter(n => !snapshots.has(n));
       if (missing.length) throw new Error(`Not found in ${repo}: ${missing.map(n => `#${n}`).join(', ')}.`);
-      // A new watch is a baseline: the caller sees the current state in the reply, so nothing is announced.
+      if (branch && !branches.get(branch)) throw new Error(`Branch ${branch} not found in ${repo}.`);
       for (const [n, s] of snapshots) if ((s.state === 'OPEN' && !watch.ignore?.includes(n)) || watch.prs.includes(n)) watch.snapshots[n] = settle(watch.snapshots[n], s);
+      if (branch) watch.branches![branch] = baselineBranch(branches.get(branch)!);
       this.prune(watch);
       watch.lastPoll = this.now();
-      if (watch.mode === 'list' && !watch.prs.length) throw new Error(`Every listed PR in ${repo} is already merged or closed.`);
+      if (watch.mode === 'list' && !watch.prs.length && !branch) throw new Error(`Every listed PR in ${repo} is already merged or closed.`);
       state.repos[repo] = watch;
       this.store.save(state);
       return watch;
     });
   }
 
-  unwatch(repo: string, prs: number[] | undefined) {
+  unwatch(repo: string, prs: number[] | undefined, branch?: string) {
     return this.exclusive(async () => {
       const state = this.store.load();
       const watch = state.repos[repo];
       if (!watch) return false;
-      if (!prs?.length) delete state.repos[repo];
-      else {
+      if (!prs?.length && !branch) delete state.repos[repo];
+      else if (branch) {
+        if (!watch.branches?.[branch]) return false;
+        delete watch.branches[branch];
+        if (isEmpty(watch)) delete state.repos[repo];
+      } else if (prs?.length) {
         watch.prs = watch.prs.filter(n => !prs.includes(n));
         for (const n of prs) delete watch.snapshots[n];
         if (watch.mode === 'open') watch.ignore = [...new Set([...watch.ignore ?? [], ...prs])];
-        if (watch.mode === 'list' && !watch.prs.length) delete state.repos[repo];
+        if (isEmpty(watch)) delete state.repos[repo];
       }
       this.store.save(state);
       return true;
@@ -117,25 +136,16 @@ export class Watcher {
       for (const [repo, watch] of Object.entries(state.repos)) {
         if (only && repo !== only) continue;
         try {
-          const { snapshots, open } = await this.fetch(repo, watch, signal);
-          const events: WatchEvent[] = [];
-          const seen = new Set([...Object.keys(watch.snapshots).map(Number), ...watch.prs, ...open ?? []]);
-          for (const n of seen) {
-            if (watch.ignore?.includes(n)) continue;
-            const cur = snapshots.get(n);
-            if (!cur) continue;
-            const prev = watch.snapshots[n];
-            const next = settle(prev, cur);
-            if (prev || watch.mode === 'open') events.push(...diff(prev, next));
-            watch.snapshots[n] = next;
-          }
+          const { snapshots, open, branches } = await this.fetch(repo, watch, signal);
+          const events = [...advancePrs(watch, snapshots, open, this.now()), ...advanceBranches(watch, branches)];
           if (watch.failures >= FAILURES_BEFORE_NOTICE) events.push({ pr: 0, kind: 'checks', text: `polling recovered after ${watch.failures} failures`, wake: false });
           watch.failures = 0; delete watch.lastError; watch.lastPoll = this.now();
           const shown = new Map(Object.values(watch.snapshots).map(s => [s.number, s]));
-          this.prune(watch);
-          if (watch.mode === 'list' && !watch.prs.length) delete state.repos[repo];
+          const shownBranches = new Map(Object.entries(watch.branches ?? {}));
+          this.prune(watch, true);
+          if (isEmpty(watch)) delete state.repos[repo];
           all.set(repo, events);
-          if (events.some(e => e.wake)) notices.push({ repo, events, text: noticeText(repo, events.filter(e => e.pr !== 0), shown, this.now()) });
+          if (events.some(e => e.wake)) notices.push({ repo, events, text: noticeText(repo, events.filter(isShown), shown, this.now(), shownBranches) });
         } catch (error) {
           if (signal?.aborted) throw error;
           watch.failures++; watch.lastError = error instanceof Error ? error.message : String(error);
@@ -150,18 +160,96 @@ export class Watcher {
     });
   }
 
-  private async fetch(repo: string, watch: RepoWatch, signal?: AbortSignal) {
+  private async fetch(repo: string, watch: RepoWatch, signal?: AbortSignal, extraBranch?: string) {
     const tracked = [...new Set([...watch.prs, ...Object.keys(watch.snapshots).map(Number)])].slice(0, MAX_PRS);
-    const fetched = await fetchRepo(this.run, repo, tracked, watch.mode === 'open', signal);
-    return { snapshots: new Map([...fetched.prs].map(([n, raw]) => [n, normalize(raw)])), open: fetched.open };
+    const names = [...new Set([...Object.keys(watch.branches ?? {}), ...extraBranch ? [extraBranch] : []])];
+    const fetched = await fetchRepo(this.run, repo, tracked, watch.mode === 'open', signal, names);
+    const branches = new Map<string, BranchSnapshot>();
+    for (const [name, raw] of fetched.branches) if (raw) branches.set(name, normalizeBranch(name, raw));
+    return { snapshots: new Map([...fetched.prs].map(([n, raw]) => [n, normalize(raw)])), open: fetched.open, branches };
   }
 
-  /** Merged and closed PRs are reported once, then forgotten; a list watch keeps only the PRs still open. */
-  private prune(watch: RepoWatch) {
+  /**
+   * Merged and closed PRs are reported once, then forgotten; a list watch keeps only the PRs still open. After a poll,
+   * a branch whose CI was reported is dropped too.
+   */
+  private prune(watch: RepoWatch, branches = false) {
     for (const [n, s] of Object.entries(watch.snapshots)) if (s.state !== 'OPEN') delete watch.snapshots[n];
     if (watch.mode === 'list') watch.prs = watch.prs.filter(n => watch.snapshots[n]);
+    if (branches && watch.branches) {
+      for (const [name, s] of Object.entries(watch.branches)) if (s.reported) delete watch.branches[name];
+      if (!Object.keys(watch.branches).length) delete watch.branches;
+    }
   }
 }
+
+/** The watch a request leads to, before GitHub confirms its PRs and branch exist. */
+function nextWatch(existing: RepoWatch | undefined, { prs, branch }: WatchRequest): RepoWatch {
+  const mode = prs?.length || branch ? 'list' : 'open';
+  const merged = mode === 'list' && existing?.mode === 'list' ? [...new Set([...existing.prs, ...prs ?? []])] : prs ?? [];
+  if (merged.length > MAX_PRS) throw new Error(`At most ${MAX_PRS} PRs per repository.`);
+  const watch: RepoWatch = {
+    mode: existing?.mode === 'open' ? 'open' : mode, prs: merged.sort((a, b) => a - b), snapshots: existing?.snapshots ?? {},
+    failures: 0, ...existing?.branches ? { branches: existing.branches } : {},
+  };
+  const ignore = existing?.ignore?.filter(n => !prs?.includes(n));
+  // Watching the whole repository again forgets the PRs unwatched from it; adding PRs or a branch keeps that list.
+  if (watch.mode === 'open' && ignore?.length && (prs?.length || branch)) watch.ignore = ignore;
+  if (!branch) return watch;
+  if (!watch.branches?.[branch] && Object.keys(watch.branches ?? {}).length >= MAX_BRANCHES) throw new Error(`At most ${MAX_BRANCHES} branches per repository.`);
+  // Re-watching a branch starts over: the latest commit's CI is reported even if an older one already was.
+  watch.branches = { ...watch.branches };
+  delete watch.branches[branch];
+  return watch;
+}
+
+/** Moves every tracked PR to its new snapshot and returns the transitions, auto-merge stalls included. */
+function advancePrs(watch: RepoWatch, snapshots: Map<number, Snapshot>, open: number[] | undefined, now: number): WatchEvent[] {
+  const events: WatchEvent[] = [];
+  for (const n of new Set([...Object.keys(watch.snapshots).map(Number), ...watch.prs, ...open ?? []])) {
+    const cur = snapshots.get(n);
+    if (watch.ignore?.includes(n) || !cur) continue;
+    const prev = watch.snapshots[n];
+    const { snapshot: next, event: stall } = autoMergeStall(prev, settle(prev, cur), now);
+    if (prev || watch.mode === 'open') events.push(...diff(prev, next), ...stall ? [stall] : []);
+    watch.snapshots[n] = next;
+  }
+  return events;
+}
+
+/** Moves every watched branch to its latest commit; a deleted branch has nothing left to report and is dropped. */
+function advanceBranches(watch: RepoWatch, branches: Map<string, BranchSnapshot>): WatchEvent[] {
+  const events: WatchEvent[] = [];
+  for (const [name, prev] of Object.entries(watch.branches ?? {})) {
+    const cur = branches.get(name);
+    if (!cur) { delete watch.branches![name]; continue; }
+    const { snapshot, events: changes } = branchDiff(prev, cur);
+    watch.branches![name] = snapshot;
+    events.push(...changes);
+  }
+  return events;
+}
+
+/**
+ * After a push of `branch`: follows its open PR when it has one (an open-PR watch already does), else the CI of
+ * the pushed commit. Returns what is now followed.
+ */
+export async function watchPush(watcher: Watcher, repo: string, branch: string): Promise<string> {
+  const pr = await openPrFor(watcher.run, repo, branch);
+  if (!pr) {
+    await watcher.watch(repo, { branch });
+    return `${repo} ${branch} CI`;
+  }
+  const existing = watcher.state().repos[repo];
+  const covered = existing && (existing.mode === 'open' ? !existing.ignore?.includes(pr) : existing.prs.includes(pr));
+  if (!covered) await watcher.watch(repo, { prs: [pr] });
+  return `${repo} #${pr}`;
+}
+
+/** A list watch with no PR and no branch left has nothing to follow. */
+const isEmpty = (watch: RepoWatch) => watch.mode === 'list' && !watch.prs.length && !Object.keys(watch.branches ?? {}).length;
+/** Watcher-level events (pr 0 without a branch) are not about any PR line. */
+const isShown = (e: WatchEvent) => e.pr !== 0 || e.branch !== undefined;
 
 /** The status the tool returns: aggregates first, then one line per PR with its next step. */
 export function statusText(state: State, events: Map<string, WatchEvent[]>, only: string | undefined, now: number): string {
@@ -169,17 +257,24 @@ export function statusText(state: State, events: Map<string, WatchEvent[]>, only
   if (!repos.length) return only
     ? `${only} is not watched. Start: gitwatch {"action":"watch","repo":"${only}"} (all open PRs) or add "prs":[123].`
     : 'No repositories watched. Start: gitwatch {"action":"watch","repo":"owner/name"} (all open PRs) or add "prs":[123].';
-  return repos.map(([repo, w]) => {
-    const prs = Object.values(w.snapshots).sort((a, b) => a.number - b.number);
-    const count = (f: (s: Snapshot) => boolean) => prs.filter(f).length;
-    const totals = [`${prs.length} open ${w.mode === 'open' ? '(all open PRs)' : `(listed: ${w.prs.map(n => `#${n}`).join(' ')})`}`,
-      `${count(s => s.checks.state === 'fail')} failing`, `${count(s => s.checks.state === 'pending')} running`,
-      `${count(s => s.mergeState === 'DIRTY')} conflicting`, `${count(s => s.mergeState === 'CLEAN')} clean`].join(', ');
-    const polled = w.lastPoll ? `polled ${brt(w.lastPoll)}` : 'not polled yet';
-    const error = w.lastError ? `\nlast poll failed (${w.failures}x): ${w.lastError}` : '';
-    const changes = (events.get(repo) ?? []).filter(e => e.pr !== 0);
-    const changed = changes.length ? `\nchanged since last poll: ${changes.map(e => `#${e.pr} ${e.text}`).join('; ')}` : '';
-    const rows = prs.map(s => { const next = hint(s, repo); return `${line(s)}${next ? `\n  next: ${next}` : ''}`; });
-    return [`${repo} · ${totals} · ${polled}${error}${changed}`, ...rows.length ? rows : ['no open PRs; new ones will be reported']].join('\n');
-  }).join('\n\n') + `\nEvery ${state.intervalSec}s the watcher wakes you on finished or failed checks, conflicts, merges and closes.`;
+  return repos.map(([repo, w]) => repoStatus(repo, w, events.get(repo) ?? [])).join('\n\n')
+    + `\nEvery ${state.intervalSec}s the watcher wakes you on failed or finished checks, conflicts, merges and closes, and when a watched branch's CI finishes.`;
+}
+
+/** One repository's status: totals, poll health, changes this refresh found, then a line per PR and branch. */
+function repoStatus(repo: string, w: RepoWatch, events: WatchEvent[]): string {
+  const prs = Object.values(w.snapshots).sort((a, b) => a.number - b.number);
+  const count = (f: (s: Snapshot) => boolean) => prs.filter(f).length;
+  const totals = [`${prs.length} open ${w.mode === 'open' ? '(all open PRs)' : `(listed: ${w.prs.map(n => `#${n}`).join(' ')})`}`,
+    `${count(s => s.checks.state === 'fail')} failing`, `${count(s => s.checks.state === 'pending')} running`,
+    `${count(s => s.mergeState === 'DIRTY')} conflicting`, `${count(s => s.mergeState === 'CLEAN')} clean`,
+    ...w.branches && Object.keys(w.branches).length ? [`branch CI: ${Object.keys(w.branches).join(' ')}`] : []].join(', ');
+  const polled = w.lastPoll ? `polled ${brt(w.lastPoll)}` : 'not polled yet';
+  const error = w.lastError ? `\nlast poll failed (${w.failures}x): ${w.lastError}` : '';
+  const changes = events.filter(isShown);
+  const changed = changes.length ? `\nchanged since last poll: ${changes.map(e => `${e.branch ?? `#${e.pr}`} ${e.text}`).join('; ')}` : '';
+  const withNext = (text: string, next?: string) => `${text}${next ? `\n  next: ${next}` : ''}`;
+  const rows = [...prs.map(s => withNext(line(s), hint(s, repo))), ...Object.values(w.branches ?? {}).map(b => withNext(branchLine(b), branchHint(b, repo)))];
+  const empty = w.mode === 'open' ? 'no open PRs; new ones will be reported' : 'nothing left to follow';
+  return [`${repo} · ${totals} · ${polled}${error}${changed}`, ...rows.length ? rows : [empty]].join('\n');
 }

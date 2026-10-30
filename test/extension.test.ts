@@ -2,9 +2,9 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import extension, { Lease, MESSAGE_TYPE } from '../src/index.ts';
 import { Store } from '../src/watcher.ts';
-import { FakeGitHub, pr, tempDir } from './fixtures.ts';
+import { commit, FakeGitHub, pr, tempDir } from './fixtures.ts';
 
-type Handler = (event: unknown, ctx: { mode: string }) => unknown;
+type Handler = (event: unknown, ctx: { mode: string; cwd?: string }) => unknown;
 function harness(mode = 'tui', dir = tempDir()) {
   const gh = new FakeGitHub();
   const handlers = new Map<string, Handler>();
@@ -16,7 +16,7 @@ function harness(mode = 'tui', dir = tempDir()) {
     registerTool: (t: typeof tool) => { tool = t; },
     sendMessage: (message: { customType: string; content: string }, options: unknown) => sent.push({ message, options }),
   };
-  extension(pi as never, { run: gh.run, store: new Store(dir), schedule: fn => { timers.push(fn); return timers.length; }, cancel: () => {} });
+  extension(pi as never, { run: gh.run, git: async args => args[0] === 'remote' ? 'https://github.com/o/r.git' : 'main', store: new Store(dir), schedule: fn => { timers.push(fn); return timers.length; }, cancel: () => {} });
   handlers.get('session_start')!({}, { mode });
   const call = (params: Record<string, unknown>) => tool!.execute('id', params, undefined, undefined, {});
   /** Runs the scheduled poll and waits for it to settle. */
@@ -66,6 +66,8 @@ test('invalid input fails before any GitHub call, with a corrective hint', async
     [{ action: 'watch', repo: 'not a repo' }, /repo must be owner\/name/],
     [{ action: 'status', prs: [1] }, /status accepts only repo/],
     [{ action: 'merge', repo: 'o/r' }, /Unknown action merge/],
+    [{ action: 'watch', repo: 'o/r', prs: [1], branch: 'main' }, /prs or branch, not both/],
+    [{ action: 'status', branch: 'main' }, /status accepts only repo/],
   ] as const) {
     const r = await h.call(params);
     assert.equal(r.isError, true);
@@ -83,4 +85,24 @@ test('shutdown stops polling and releases the lease', async () => {
   await h.fire();
   h.handlers.get('session_shutdown')!({}, { mode: 'tui' });
   assert.equal(new Lease(h.dir, process.ppid).acquire(Date.now(), 90_000), true);
+});
+
+test('a successful push or gh pr create in bash starts a watch and says so in the output', async () => {
+  const h = harness();
+  h.gh.set(pr(5, {}, [['test', 'QUEUED']]));
+  h.gh.branches.set('main', commit('e5', [['test', 'QUEUED']]));
+  const onResult = h.handlers.get('tool_result')!;
+  const bash = (command: string, text = '', isError = false) =>
+    onResult({ toolName: 'bash', input: { command }, content: [{ type: 'text', text }], isError }, { mode: 'tui', cwd: '/w' }) as Promise<{ content: { text: string }[] } | undefined>;
+  const pushed = await bash('cd /w/dotfiles && git push -q origin main');
+  assert.match(pushed!.content.at(-1)!.text, /^\[gitwatch\] now following o\/r main CI: you are woken when CI finishes/);
+  assert.deepEqual(Object.keys(new Store(h.dir).load().repos['o/r'].branches!), ['main']);
+  const created = await bash('gh pr create --fill', 'https://github.com/o/r/pull/5\n');
+  assert.match(created!.content.at(-1)!.text, /now following o\/r #5/);
+  assert.equal(await bash('git push origin main', 'rejected', true), undefined, 'a failed command is not followed');
+  assert.equal(await bash('git status'), undefined);
+  h.gh.fail = 'HTTP 502';
+  assert.match((await bash('gh pr create --fill', 'https://github.com/o/r/pull/5\n'))!.content.at(-1)!.text, /could not start following o\/r #5: HTTP 502/);
+  const child = harness('json');
+  assert.equal(await child.handlers.get('tool_result')!({ toolName: 'bash', input: { command: 'git push' }, content: [], isError: false }, { mode: 'json' }), undefined, 'a non-polling session never watches');
 });
