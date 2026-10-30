@@ -10,6 +10,20 @@ const setup = () => {
   return { gh, watcher, tick: () => { clock += 30_000; } };
 };
 
+test('delivery evidence survives reload without upgrading legacy routing counts', async () => {
+  const { watcher } = setup();
+  const legacy = { ...watcher.state(), stats: { since: Date.UTC(2026, 9, 1), woke: 99, quiet: 80 } };
+  watcher.store.save(legacy);
+  assert.match(statusText(legacy, new Map(), undefined, 0), /Host delivery: not measured yet/);
+  await Promise.all([watcher.recordDelivery(true, true), watcher.recordDelivery(false, true), watcher.recordDelivery(true, false)]);
+  const reloaded = new Watcher(new Store(watcher.store.dir), watcher.run).state();
+  assert.deepEqual(reloaded.deliveries, { since: Date.UTC(2026, 9, 30, 16, 50), wakeAccepted: 1, quietAccepted: 1, uncertain: 1 });
+  const text = statusText(reloaded, new Map(), 'o/absent', 0);
+  assert.match(text, /99 wake, 80 next-turn; not delivery evidence/);
+  assert.match(text, /Host accepted: 1 wake requests, 1 next-turn notices; 1 uncertain/);
+  assert.match(text, /all repos/);
+});
+
 test('a new watch is a silent baseline; a finished check wakes once', async () => {
   const { gh, watcher } = setup();
   gh.set(pr(750, {}, [['test', 'IN_PROGRESS']]), pr(751, { mergeStateStatus: 'DIRTY' }));
@@ -124,7 +138,7 @@ test('auto-merge PRs stay quiet when checks pass and wake once if they do not me
   assert.match(woken[0].text, /#6 auto-merge has not merged 10 min after checks passed \(BLOCKED\)[\s\S]*next: auto-merge is waiting/);
 });
 
-test('quiet and woken notices are counted, so the share of events that needed no model turn is measurable', async () => {
+test('routing counts notices rather than events or model turns', async () => {
   const { gh, watcher } = setup();
   gh.set(pr(1, { autoMergeRequest: {} }, [['test', 'IN_PROGRESS']]), pr(2, {}, [['test', 'IN_PROGRESS']]));
   await watcher.watch('o/r', { prs: [1, 2] });
@@ -137,7 +151,7 @@ test('quiet and woken notices are counted, so the share of events that needed no
   assert.deepEqual([state.stats?.woke, state.stats?.quiet], [2, 0]);
 });
 
-test('an expected merge alone makes a quiet notice and is counted as needing no turn', async () => {
+test('an expected merge alone is routed quietly, without claiming delivery evidence', async () => {
   const { gh, watcher } = setup();
   gh.set(pr(5, { autoMergeRequest: {} }, [['test', 'IN_PROGRESS']]));
   await watcher.watch('o/r', { prs: [5] });
@@ -145,7 +159,7 @@ test('an expected merge alone makes a quiet notice and is counted as needing no 
   const { notices } = await watcher.poll();
   assert.deepEqual(notices.map(n => [n.wake, /#5 merged eeeeee12/.test(n.text)]), [[false, true]]);
   assert.deepEqual([watcher.state().stats?.woke, watcher.state().stats?.quiet], [0, 1]);
-  assert.match(statusText({ ...watcher.state(), repos: { 'o/r': { mode: 'open', prs: [], snapshots: {}, failures: 0 } } }, new Map(), undefined, 0), /0 notices woke you, 1 expected merges were only recorded \(no turn\)/);
+  assert.match(statusText({ ...watcher.state(), repos: { 'o/r': { mode: 'open', prs: [], snapshots: {}, failures: 0 } } }, new Map(), undefined, 0), /0 wake, 1 next-turn; not delivery evidence/);
 });
 
 test('the clone a push came from rides on the merge notice with the merged head, even into an existing open watch', async () => {

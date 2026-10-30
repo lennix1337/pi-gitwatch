@@ -68,12 +68,21 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
   const cancel = options.cancel ?? ((h: unknown) => clearTimeout(h as NodeJS.Timeout));
   let timer: unknown;
   let running = false;
+  let warn: ((text: string) => void) | undefined;
 
   // A notice that needs the agent wakes it; an expected merge only waits for its next turn (no model call).
-  const deliver = (notice: Notice) => pi.sendMessage(
-    { customType: MESSAGE_TYPE, content: notice.text, display: true, details: { repo: notice.repo, events: notice.events } },
-    notice.wake ? { triggerTurn: true, deliverAs: 'steer' } : { deliverAs: 'nextTurn' },
-  );
+  const deliver = async (notice: Notice) => {
+    let accepted = false;
+    try {
+      await pi.sendMessage(
+        { customType: MESSAGE_TYPE, content: notice.text, display: true, details: { repo: notice.repo, events: notice.events } },
+        notice.wake ? { triggerTurn: true, deliverAs: 'steer' } : { deliverAs: 'nextTurn' },
+      );
+      accepted = true;
+    } catch { /* A rejected dispatch may have taken effect; record uncertainty without replaying it. */ }
+    await watcher.recordDelivery(notice.wake, accepted);
+    if (!accepted) warn?.('Gitwatch: notice delivery is uncertain. Inspect session activity before retrying; no automatic replay.');
+  };
 
   const tick = async () => {
     timer = undefined;
@@ -84,15 +93,18 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
       if (Object.keys(state.repos).length && lease.acquire(now(), interval * 3)) {
         const { notices } = await watcher.poll();
         for (const n of notices) n.text += await cleanupNote(git, n);
-        if (running) for (const n of notices) deliver(n);
+        for (const n of notices) { if (!running) break; await deliver(n); }
       }
-    } catch { /* a failed poll is counted per repository and reported by the watcher */ }
-    if (running) { timer = schedule(() => void tick(), interval); (timer as { unref?(): void })?.unref?.(); }
+    } catch { warn?.('Gitwatch: polling or local delivery evidence could not be completed. Inspect gitwatch status and local state before retrying.'); }
+    if (running) { timer = schedule(() => tick(), interval); (timer as { unref?(): void })?.unref?.(); }
   };
-  const start = () => { if (running) return; running = true; timer = schedule(() => void tick(), 1000); (timer as { unref?(): void })?.unref?.(); };
+  const start = () => { if (running) return; running = true; timer = schedule(() => tick(), 1000); (timer as { unref?(): void })?.unref?.(); };
   const stop = () => { running = false; if (timer !== undefined) cancel(timer); timer = undefined; lease.release(); };
 
-  pi.on('session_start', (_event, ctx) => { if (ctx.mode === 'tui') start(); });
+  pi.on('session_start', (_event, ctx) => {
+    warn = ctx.hasUI ? text => ctx.ui.notify(text, 'warning') : undefined;
+    if (ctx.mode === 'tui') start();
+  });
   pi.on('session_shutdown', stop);
   // Only the polling (interactive) session follows its own pushes; a child's push is its parent's to watch.
   pi.on('tool_result', async (event, ctx) => {

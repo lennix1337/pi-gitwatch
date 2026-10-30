@@ -4,24 +4,25 @@ import extension, { Lease, MESSAGE_TYPE } from '../src/index.ts';
 import { Store } from '../src/watcher.ts';
 import { commit, FakeGitHub, pr, tempDir } from './fixtures.ts';
 
-type Handler = (event: unknown, ctx: { mode: string; cwd?: string }) => unknown;
-function harness(mode = 'tui', dir = tempDir()) {
+type Handler = (event: unknown, ctx: { mode: string; cwd?: string; hasUI?: boolean; ui?: { notify: (text: string) => void } }) => unknown;
+function harness(mode = 'tui', dir = tempDir(), send?: () => void | Promise<void>) {
   const gh = new FakeGitHub();
   const handlers = new Map<string, Handler>();
   const sent: { message: { customType: string; content: string }; options: unknown }[] = [];
   const timers: (() => void)[] = [];
+  const warnings: string[] = [];
   let tool: { execute: (...a: unknown[]) => Promise<{ content: { text: string }[]; isError?: boolean }> } | undefined;
   const pi = {
     on: (name: string, h: Handler) => handlers.set(name, h),
     registerTool: (t: typeof tool) => { tool = t; },
-    sendMessage: (message: { customType: string; content: string }, options: unknown) => sent.push({ message, options }),
+    sendMessage: (message: { customType: string; content: string }, options: unknown) => { sent.push({ message, options }); return send?.(); },
   };
   extension(pi as never, { run: gh.run, git: async args => args[0] === 'remote' ? 'https://github.com/o/r.git' : 'main', store: new Store(dir), schedule: fn => { timers.push(fn); return timers.length; }, cancel: () => {} });
-  handlers.get('session_start')!({}, { mode });
+  handlers.get('session_start')!({}, { mode, hasUI: true, ui: { notify: text => warnings.push(text) } });
   const call = (params: Record<string, unknown>) => tool!.execute('id', params, undefined, undefined, {});
   /** Runs the scheduled poll and waits for it to settle. */
-  const fire = async () => { const fn = timers.shift(); assert.ok(fn, 'a poll is scheduled'); fn(); await new Promise(r => setTimeout(r, 20)); };
-  return { gh, sent, timers, call, fire, handlers, dir };
+  const fire = async () => { const fn = timers.shift(); assert.ok(fn, 'a poll is scheduled'); await fn(); };
+  return { gh, sent, timers, call, fire, handlers, dir, warnings };
 }
 
 test('a watched PR whose checks finish wakes the session with a steer message', async () => {
@@ -39,6 +40,65 @@ test('a watched PR whose checks finish wakes the session with a steer message', 
   assert.equal(h.timers.length, 1, 'polling continues');
 });
 
+test('delivery waits for host acceptance before recording it or scheduling another poll', async () => {
+  let accept!: () => void, entered!: () => void;
+  const pending = new Promise<void>(r => { accept = r; });
+  const started = new Promise<void>(r => { entered = r; });
+  const h = harness('tui', tempDir(), () => { entered(); return pending; });
+  h.gh.set(pr(1, {}, [['test', 'IN_PROGRESS']]));
+  await h.call({ action: 'watch', repo: 'o/r', prs: [1] });
+  h.gh.set(pr(1, { mergeStateStatus: 'CLEAN' }));
+  const fired = h.fire();
+  await started;
+  try { assert.equal(h.timers.length, 0, 'do not finish the tick before the host accepts'); }
+  finally { accept(); await fired; }
+  const status = (await h.call({})).content[0].text;
+  assert.match(status, /Host accepted: 1 wake requests, 0 next-turn notices; 0 uncertain/);
+  assert.match(status, /not model runs or saved turns/);
+  assert.doesNotMatch(status, /notices woke you/);
+});
+
+test('shutdown during an awaited send records its outcome but starts no further delivery or poll', async () => {
+  let accept!: () => void, entered!: () => void;
+  const pending = new Promise<void>(r => { accept = r; });
+  const started = new Promise<void>(r => { entered = r; });
+  const h = harness('tui', tempDir(), () => { entered(); return pending; });
+  h.gh.set(pr(1, {}, [['test', 'IN_PROGRESS']]));
+  await h.call({ action: 'watch', repo: 'o/r', prs: [1] });
+  h.gh.set(pr(2, {}, [['test', 'IN_PROGRESS']]));
+  await h.call({ action: 'watch', repo: 'o/s', prs: [2] });
+  h.gh.set(pr(1, { mergeStateStatus: 'CLEAN' }), pr(2, { mergeStateStatus: 'CLEAN' }));
+  const fired = h.fire();
+  await started;
+  h.handlers.get('session_shutdown')!({}, { mode: 'tui' });
+  accept(); await fired;
+  assert.equal(h.sent.length, 1);
+  assert.equal(h.timers.length, 0);
+  assert.equal(new Store(h.dir).load().deliveries?.wakeAccepted, 1);
+});
+
+test('sync throws and async rejections stay uncertain, are not replayed, and do not stop other notices', async () => {
+  for (const failure of [() => { throw new Error('host rejected'); }, () => Promise.reject(new Error('host rejected'))]) {
+    let attempts = 0;
+    const h = harness('tui', tempDir(), () => { if (++attempts === 1) return failure(); });
+    h.gh.set(pr(1, {}, [['test', 'IN_PROGRESS']]));
+    await h.call({ action: 'watch', repo: 'o/r', prs: [1] });
+    h.gh.set(pr(2, {}, [['test', 'IN_PROGRESS']]));
+    await h.call({ action: 'watch', repo: 'o/s', prs: [2] });
+    h.gh.set(pr(1, { mergeStateStatus: 'CLEAN' }), pr(2, { mergeStateStatus: 'CLEAN' }));
+    await h.fire();
+    assert.equal(h.sent.length, 2, 'a rejected first send does not drop the second repository');
+    assert.equal(h.timers.length, 1);
+    assert.equal(h.warnings.length, 1);
+    assert.match(h.warnings[0], /delivery is uncertain.*Inspect session activity.*no automatic replay/);
+    const status = (await h.call({})).content[0].text;
+    assert.match(status, /Host accepted: 1 wake requests, 0 next-turn notices; 1 uncertain \(no automatic replay\)/);
+    await h.fire();
+    assert.equal(h.sent.length, 2, 'an uncertain dispatch is not retried');
+    assert.equal(h.warnings.length, 1, 'the failure is reported once');
+  }
+});
+
 test('status refreshes now and shows the change instead of announcing it later', async () => {
   const h = harness();
   h.gh.set(pr(1, {}, [['test', 'IN_PROGRESS']]));
@@ -48,6 +108,8 @@ test('status refreshes now and shows the change instead of announcing it later',
   assert.match(status.content[0].text, /changed since last poll: #1 checks failed: test/);
   await h.fire();
   assert.equal(h.sent.length, 0);
+  assert.match(status.content[0].text, /Routing decisions \(all repos\)/);
+  assert.match(status.content[0].text, /Host delivery: not measured yet/);
 });
 
 test('subagent and one-shot sessions never poll; the lease keeps one poller per machine', async () => {
@@ -122,5 +184,6 @@ test('a merge queued with auto-merge is recorded for the next turn without wakin
   assert.deepEqual(h.sent[1].options, { triggerTurn: true, deliverAs: 'steer' }, 'work waits on #32: it wakes');
   const status = await h.call({ action: 'status' });
   assert.match(status.content[0].text, /No repositories watched/);
+  assert.match(status.content[0].text, /Host accepted: 1 wake requests, 1 next-turn notices; 0 uncertain/);
   assert.equal((await h.call({ action: 'watch', repo: 'o/r', awaitMerge: true })).isError, true, 'awaitMerge needs prs');
 });
