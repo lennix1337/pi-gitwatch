@@ -6,14 +6,38 @@
   "author": "lennix1337",
   "license": "MIT",
   "type": "module",
-  "keywords": ["pi-package", "pi-extension", "github", "pull-requests", "ci"],
-  "pi": { "extensions": ["./src/index.ts"], "skills": ["./skills"] },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "github",
+    "pull-requests",
+    "ci"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
   "scripts": {
     "check": "tsc --noEmit",
     "test": "node --import tsx --test test/*.test.ts"
   },
-  "dependencies": { "typebox": "1.3.27" },
-  "peerDependencies": { "@earendil-works/pi-coding-agent": ">=1.4.0" },
-  "devDependencies": { "@earendil-works/pi-coding-agent": "1.4.0", "@types/node": "^24.0.0", "tsx": "^4.20.0", "typescript": "5.9.3" },
-  "engines": { "node": ">=24.2.0" }
+  "dependencies": {
+    "typebox": "1.3.27"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=1.4.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.4.0",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^7.0.2"
+  },
+  "engines": {
+    "node": ">=24.2.0"
+  }
 }
