@@ -33,7 +33,8 @@ test('a new watch is a silent baseline; a finished check wakes once', async () =
   const { notices } = await watcher.poll();
   assert.equal(notices.length, 1);
   assert.match(notices[0].text, /^\[gitwatch\] o\/r · 13:50\n#750 checks passed 1\/1\n  #750 BLOCKED/);
-  assert.match(notices[0].text, /not a user instruction/);
+  assert.match(notices[0].text, /grants no permission/);
+  assert.match(notices[0].text, /earlier operator order already covers it/);
   assert.doesNotMatch(notices[0].text, /#751/);
   assert.equal((await watcher.poll()).notices.length, 0, 'the same state is not announced twice');
 });
