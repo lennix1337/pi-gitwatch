@@ -58,7 +58,13 @@ export function pushes(command: string, cwd: string): Push[] {
   return found;
 }
 
-const within = (dir: string, path: string) => isAbsolute(path) || /^[A-Za-z]:[\\/]/.test(path) ? path : resolve(dir, path);
+/** Git Bash spells `C:\x` as `/c/x`; Node on Windows reads that as `\c\x` on the current drive, where git cannot start (spawn ENOENT). */
+export const nativePath = (path: string, platform: string = process.platform) =>
+  platform === 'win32' ? path.replace(/^\/([A-Za-z])(?:\/|$)/, (_, drive: string) => `${drive.toUpperCase()}:/`) : path;
+const within = (dir: string, path: string) => {
+  const native = nativePath(path);
+  return isAbsolute(native) || /^[A-Za-z]:[\\/]/.test(native) ? native : resolve(dir, native);
+};
 
 /** One `git [-C dir] [-c k=v] push [options] [remote [refspec]]` command, or undefined when it pushes no branch. */
 function gitPush(words: string[], dir: string): Push | undefined {
