@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { resolve } from 'node:path';
 import { test } from 'node:test';
-import { createdPrs, githubRepo, pushes, resolvePush } from '../src/autowatch.ts';
+import { createdPrs, githubRepo, nativePath, pushes, resolvePush } from '../src/autowatch.ts';
 
 test('only gh pr create output yields PRs to follow', () => {
   const out = 'Creating pull request\nhttps://github.com/lennix1337/pi-optchat/pull/28\n';
@@ -15,6 +15,17 @@ test('git push is found with its directory, remote and branch', () => {
   assert.deepEqual(pushes('git -C ../repo push -u origin HEAD:refs/heads/feat/y', '/work/a'), [{ dir: resolve('/work/a', '../repo'), remote: 'origin', branch: 'feat/y' }]);
   assert.deepEqual(pushes('git push', '/w'), [{ dir: '/w', remote: 'origin' }], 'no refspec: the current branch is resolved later');
   assert.deepEqual(pushes('git push -o ci.skip origin +fix', '/w'), [{ dir: '/w', remote: 'origin', branch: 'fix' }]);
+});
+
+// Seen live 2026-10-30: every `cd /c/projetos/<repo> && git push` from Git Bash ended in "could not start following push
+// in /c/projetos/<repo>: spawn git ENOENT", because Node on Windows took /c/projetos for a folder on the current drive.
+test('a Git Bash drive path names the Windows folder git runs in', () => {
+  assert.equal(nativePath('/c/projetos/pi-optchat', 'win32'), 'C:/projetos/pi-optchat');
+  assert.equal(nativePath('/d', 'win32'), 'D:/');
+  assert.equal(nativePath('/c/projetos', 'linux'), '/c/projetos', 'elsewhere /c is an ordinary folder');
+  assert.equal(nativePath('/work/a', 'win32'), '/work/a', 'only a one-letter first segment is a drive');
+  if (process.platform === 'win32') assert.deepEqual(pushes('cd /c/projetos/pi-optchat && git push -u origin feat', 'C:/Users/me'),
+    [{ dir: 'C:/projetos/pi-optchat', remote: 'origin', branch: 'feat' }]);
 });
 
 test('tags, deletions, dry runs and non-push git commands are ignored', () => {
