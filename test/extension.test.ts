@@ -140,6 +140,33 @@ test('invalid input fails before any GitHub call, with a corrective hint', async
   assert.match((await h.call({})).content[0].text, /^No repositories watched/);
 });
 
+test('a session restart during a poll leaves exactly one poll loop', async () => {
+  let accept!: () => void, entered!: () => void;
+  const pending = new Promise<void>(r => { accept = r; });
+  const started = new Promise<void>(r => { entered = r; });
+  const h = harness('tui', tempDir(), () => { entered(); return pending; });
+  h.gh.set(pr(1, {}, [['test', 'IN_PROGRESS']]));
+  await h.call({ action: 'watch', repo: 'o/r', prs: [1] });
+  h.gh.set(pr(1, { mergeStateStatus: 'CLEAN' }));
+  const fired = h.fire();
+  await started;
+  h.handlers.get('session_shutdown')!({}, { mode: 'tui' });
+  h.handlers.get('session_start')!({}, { mode: 'tui', hasUI: true, ui: { notify: () => {} } });
+  assert.equal(h.timers.length, 1, 'the restart schedules its own first poll');
+  accept(); await fired;
+  assert.equal(h.timers.length, 1, 'the poll that began before the restart does not schedule a second loop');
+});
+
+test('a watch made from a subagent or one-shot session does not start a poll loop there', async () => {
+  const child = harness('json');
+  child.gh.set(pr(1, {}, [['test', 'IN_PROGRESS']]));
+  await child.call({ action: 'watch', repo: 'o/r', prs: [1] });
+  assert.equal(child.timers.length, 0);
+  assert.deepEqual(Object.keys(new Store(child.dir).load().repos), ['o/r'], 'the watch is still recorded for the interactive poller');
+  const bash = { toolName: 'bash', input: { command: 'git commit -m x && git ' + 'push origin main' }, content: [], isError: false };
+  assert.equal(await child.handlers.get('tool_result')!(bash, { mode: 'json', cwd: '/w' }), undefined);
+});
+
 test('shutdown stops polling and releases the lease', async () => {
   const h = harness();
   h.gh.set(pr(1));

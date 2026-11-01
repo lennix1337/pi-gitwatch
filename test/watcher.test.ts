@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { test } from 'node:test';
 import { FAILURES_BEFORE_NOTICE, statusText, Store, Watcher, watchPush } from '../src/watcher.ts';
 import { commit, FakeGitHub, pr, tempDir } from './fixtures.ts';
@@ -22,6 +24,18 @@ test('delivery evidence survives reload without upgrading legacy routing counts'
   assert.match(text, /99 wake, 80 next-turn; not delivery evidence/);
   assert.match(text, /Host accepted: 1 wake requests, 1 next-turn notices; 1 uncertain/);
   assert.match(text, /all repos/);
+});
+
+test('a state file with a missing or unknown watch shape is repaired on load so polling failures still reach the agent', async () => {
+  const { gh, watcher } = setup();
+  const raw = { version: 1, intervalSec: 30, repos: { 'o/r': { mode: 'open', snapshots: {} }, 'o/bad': { mode: 'paused', prs: [], snapshots: {}, failures: 0 } } };
+  writeFileSync(join(watcher.store.dir, 'state.json'), JSON.stringify(raw));
+  assert.deepEqual(Object.keys(watcher.state().repos), ['o/r'], 'an unknown mode is dropped');
+  assert.equal(watcher.state().repos['o/r'].failures, 0);
+  gh.fail = 'HTTP 502';
+  const notices = [];
+  for (let i = 0; i < FAILURES_BEFORE_NOTICE; i++) notices.push(...(await watcher.poll()).notices);
+  assert.equal(notices.length, 1, 'the third failure in a row is announced');
 });
 
 test('a new watch is a silent baseline; a finished check wakes once', async () => {

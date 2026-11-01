@@ -29,6 +29,10 @@ export class Lease {
 }
 const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code === 'EPERM'; } };
 
+/** The poll loop: `waiting` for the next tick, `polling` inside one, `stopped` when the session is not following. */
+type Loop = { phase: 'stopped' } | { phase: 'waiting'; timer: unknown } | { phase: 'polling' };
+const LOOP_MOVES: Record<Loop['phase'], Loop['phase'][]> = { stopped: ['waiting', 'stopped'], waiting: ['polling', 'stopped'], polling: ['waiting', 'stopped'] };
+
 export interface Options {
   run?: Runner; git?: GitRunner; store?: Store; now?: () => number;
   schedule?: (fn: () => void, ms: number) => { unref?(): void } | unknown; cancel?: (handle: unknown) => void;
@@ -66,9 +70,27 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
   const lease = new Lease(store.dir);
   const schedule = options.schedule ?? ((fn: () => void, ms: number) => setTimeout(fn, ms));
   const cancel = options.cancel ?? ((h: unknown) => clearTimeout(h as NodeJS.Timeout));
-  let timer: unknown;
-  let running = false;
+  let loop: Loop = { phase: 'stopped' };
+  /** Changes on every stop, so a tick that began before it can neither deliver afterwards nor schedule a second loop. */
+  let epoch = 0;
+  let interactive = false;
   let warn: ((text: string) => void) | undefined;
+  let illegalMoveReported = false;
+
+  /** The only place `loop` changes: a move the table does not list is ignored and reported once. */
+  const move = (next: Loop): boolean => {
+    if (!LOOP_MOVES[loop.phase].includes(next.phase)) {
+      if (!illegalMoveReported) { illegalMoveReported = true; warn?.(`Gitwatch: ignored an impossible poll loop move ${loop.phase} -> ${next.phase}.`); }
+      return false;
+    }
+    loop = next;
+    return true;
+  };
+  const wait = (ms: number, mine: number) => {
+    const timer = schedule(() => tick(mine), ms);
+    (timer as { unref?(): void })?.unref?.();
+    move({ phase: 'waiting', timer });
+  };
 
   // A notice that needs the agent wakes it; an expected merge only waits for its next turn (no model call).
   const deliver = async (notice: Notice) => {
@@ -84,31 +106,37 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
     if (!accepted) warn?.('Gitwatch: notice delivery is uncertain. Inspect session activity before retrying; no automatic replay.');
   };
 
-  const tick = async () => {
-    timer = undefined;
-    if (!running) return;
+  const tick = async (mine: number) => {
+    if (mine !== epoch || loop.phase !== 'waiting' || !move({ phase: 'polling' })) return;
     const state = watcher.state();
     const interval = state.intervalSec * 1000;
     try {
       if (Object.keys(state.repos).length && lease.acquire(now(), interval * 3)) {
         const { notices } = await watcher.poll();
         for (const n of notices) n.text += await cleanupNote(git, n);
-        for (const n of notices) { if (!running) break; await deliver(n); }
+        for (const n of notices) { if (mine !== epoch) break; await deliver(n); }
       }
     } catch { warn?.('Gitwatch: polling or local delivery evidence could not be completed. Inspect gitwatch status and local state before retrying.'); }
-    if (running) { timer = schedule(() => tick(), interval); (timer as { unref?(): void })?.unref?.(); }
+    if (mine === epoch) wait(interval, mine);
   };
-  const start = () => { if (running) return; running = true; timer = schedule(() => tick(), 1000); (timer as { unref?(): void })?.unref?.(); };
-  const stop = () => { running = false; if (timer !== undefined) cancel(timer); timer = undefined; lease.release(); };
+  /** Only an interactive session polls; a tool call in a subagent or one-shot run records the watch for the poller. */
+  const start = () => { if (interactive && loop.phase === 'stopped') wait(1000, epoch); };
+  const stop = () => {
+    epoch++;
+    if (loop.phase === 'waiting') cancel(loop.timer);
+    move({ phase: 'stopped' });
+    lease.release();
+  };
 
   pi.on('session_start', (_event, ctx) => {
     warn = ctx.hasUI ? text => ctx.ui.notify(text, 'warning') : undefined;
-    if (ctx.mode === 'tui') start();
+    interactive = ctx.mode === 'tui';
+    start();
   });
   pi.on('session_shutdown', stop);
   // Only the polling (interactive) session follows its own pushes; a child's push is its parent's to watch.
   pi.on('tool_result', async (event, ctx) => {
-    const note = running ? await noteAfterBash(event as BashResult, watcher, git, ctx.cwd) : undefined;
+    const note = loop.phase !== 'stopped' ? await noteAfterBash(event as BashResult, watcher, git, ctx.cwd) : undefined;
     return note ? { content: [...event.content, { type: 'text' as const, text: note }] } : undefined;
   });
 

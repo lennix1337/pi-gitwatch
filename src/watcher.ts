@@ -42,7 +42,7 @@ export class Store {
   load(): State {
     try {
       const state = JSON.parse(readFileSync(this.file, 'utf8')) as State;
-      if (state.version === 1 && state.repos) return state;
+      if (state.version === 1 && state.repos) { repair(state); return state; }
     } catch { /* absent or unreadable: start empty */ }
     return { version: 1, intervalSec: DEFAULT_INTERVAL_SEC, repos: {} };
   }
@@ -51,6 +51,19 @@ export class Store {
     const tmp = `${this.file}.${process.pid}.tmp`;
     writeFileSync(tmp, JSON.stringify(state, null, 1));
     renameSync(tmp, this.file);
+  }
+}
+
+/**
+ * The file is read back as written by any version or by hand: a watch with an unknown mode is dropped, and missing or
+ * mistyped fields get their empty value (a NaN failure count would never reach the notice threshold).
+ */
+function repair(state: State) {
+  for (const [repo, watch] of Object.entries(state.repos)) {
+    if (!watch || typeof watch !== 'object' || (watch.mode !== 'open' && watch.mode !== 'list')) { delete state.repos[repo]; continue; }
+    if (!Array.isArray(watch.prs)) watch.prs = [];
+    if (!watch.snapshots || typeof watch.snapshots !== 'object') watch.snapshots = {};
+    if (!Number.isInteger(watch.failures)) watch.failures = 0;
   }
 }
 
