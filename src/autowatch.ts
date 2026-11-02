@@ -12,7 +12,7 @@ export const gitRunner: GitRunner = (args, cwd) => new Promise((done, fail) => {
 /** A PR that `gh pr create` printed. */
 export interface CreatedPr { repo: string; pr: number }
 /** A `git push` found in a shell command: where it ran, to which remote, and the branch named, if any. */
-export interface Push { dir: string; remote: string; branch?: string }
+export interface Push { dir: string; remote: string; branch?: string; implicitRemote?: true }
 
 const GITHUB_URL = /github\.com[:/]([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/?$/;
 
@@ -80,15 +80,24 @@ function gitPush(words: string[], dir: string): Push | undefined {
   if (refspec.startsWith(':') || refspec.endsWith(':')) return undefined;
   const branch = refspec.replace(/^\+/, '').split(':').pop()!.replace(/^refs\/heads\//, '');
   if (branch.startsWith('refs/')) return undefined;
-  return { dir: here, remote: positional[0] ?? 'origin', ...branch && branch !== 'HEAD' ? { branch } : {} };
+  return { dir: here, remote: positional[0] ?? 'origin', ...positional[0] ? {} : { implicitRemote: true as const }, ...branch && branch !== 'HEAD' ? { branch } : {} };
 }
 
 /** Resolves a push to `owner/name` and branch through the local repository; undefined when it is not a GitHub branch push. */
 export async function resolvePush(push: Push, git: GitRunner): Promise<{ repo: string; branch: string; clone?: string } | undefined> {
-  const url = /^(https?:|git@|ssh:)/.test(push.remote) ? push.remote : await git(['remote', 'get-url', push.remote], push.dir);
+  const target = push.implicitRemote && !push.branch ? await upstreamOf(push.dir, git) : undefined;
+  const remote = target?.remote ?? push.remote;
+  const url = /^(https?:|git@|ssh:)/.test(remote) ? remote : await git(['remote', 'get-url', remote], push.dir);
   const repo = githubRepo(url);
-  const branch = push.branch ?? await git(['rev-parse', '--abbrev-ref', 'HEAD'], push.dir);
+  const branch = push.branch ?? target?.branch ?? await git(['rev-parse', '--abbrev-ref', 'HEAD'], push.dir);
   if (!repo || !branch || branch === 'HEAD' || !BRANCH.test(branch)) return undefined;
   const clone = await git(['rev-parse', '--show-toplevel'], push.dir).catch(() => '');
   return { repo, branch, ...clone ? { clone } : {} };
+}
+
+/** Where a bare `git push` goes (`@{push}`: the upstream remote and branch name, which may be a fork under another name); undefined without an upstream. */
+async function upstreamOf(dir: string, git: GitRunner): Promise<{ remote: string; branch: string } | undefined> {
+  const ref = await git(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{push}'], dir).catch(() => '');
+  const cut = ref.indexOf('/');
+  return cut > 0 ? { remote: ref.slice(0, cut), branch: ref.slice(cut + 1) } : undefined;
 }
