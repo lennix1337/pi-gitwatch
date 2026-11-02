@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { resolve } from 'node:path';
 import { test } from 'node:test';
-import { createdPrs, githubRepo, nativePath, pushes, resolvePush } from '../src/autowatch.ts';
+import { createdPrs, githubRepo, nativePath, ownMerges, pushes, resolvePush } from '../src/autowatch.ts';
 
 test('only gh pr create output yields PRs to follow', () => {
   const out = 'Creating pull request\nhttps://github.com/lennix1337/pi-optchat/pull/28\n';
@@ -65,4 +65,15 @@ test('a bare push follows the remote and branch the push really goes to', async 
   assert.deepEqual(await resolvePush({ dir: '/w', remote: 'origin' }, git), { repo: 'lennix1337/Genexus18MCP', branch: 'fix/x', clone: 'C:/w' }, 'an explicit remote is never replaced');
   const noUpstream = async (args: string[]) => { if (args.includes('@{push}')) throw new Error('no upstream'); return args[0] === 'remote' ? 'git@github.com:o/r.git' : 'main'; };
   assert.deepEqual(await resolvePush({ dir: '/w', remote: 'origin', implicitRemote: true }, noUpstream), { repo: 'o/r', branch: 'main', clone: 'main' }, 'without an upstream the current branch on origin is used');
+});
+
+test('a gh pr merge that merges now is an own merge; a queued one (--auto), a dry word and a failed-to-name PR are not', () => {
+  assert.deepEqual(ownMerges('gh pr merge 12 --repo o/r --squash', '/x'), [{ pr: 12, repo: 'o/r', dir: '/x' }]);
+  assert.deepEqual(ownMerges('gh pr merge https://github.com/o/r/pull/7 --squash', '/x'), [{ pr: 7, repo: 'o/r', dir: '/x' }], 'a PR URL names its repository');
+  assert.deepEqual(ownMerges('gh pr merge 12 -R o/r -t "merge 9"', '/x'), [{ pr: 12, repo: 'o/r', dir: '/x' }], 'a value after -t is not a PR');
+  assert.deepEqual(ownMerges('gh pr merge 12 --auto --repo o/r', '/x'), [], 'auto-merge only queues the merge');
+  assert.deepEqual(ownMerges('echo gh pr merge 12', '/x'), [], 'a word inside another command is not a merge');
+  assert.deepEqual(ownMerges('gh pr merge --squash', '/x'), [], 'no PR named: nothing is recorded');
+  assert.deepEqual(ownMerges('gh pr merge 3 && gh pr merge 4 --auto', '/x'), [{ pr: 3, dir: '/x' }], 'each command of a chain is read');
+  assert.deepEqual(ownMerges('cd sub && gh pr merge 5', '/x'), [{ pr: 5, dir: resolve('/x', 'sub') }], 'the merge runs where the cd leads');
 });

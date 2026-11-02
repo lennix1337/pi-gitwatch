@@ -1,13 +1,14 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { AUTO_MERGE_STALL_MS, autoMergeStall, branchDiff, branchHint, branchLine, diff, hint, line, normalize, normalizeBranch, settle, summarizeChecks } from '../src/model.ts';
+import { AUTO_MERGE_STALL_MS, autoMergeStall, branchDiff, branchHint, branchLine, diff, hint, jobsText, line, normalize, normalizeBranch, settle, summarizeChecks, type WatchEvent } from '../src/model.ts';
+import { announce, routeEvent } from '../src/route.ts';
 import { commit, pr } from './fixtures.ts';
 
 const ctx = (name: string, status: string, conclusion: string | null = null) => ({ __typename: 'CheckRun', name, status, conclusion });
 
 test('a cancelled duplicate next to a passing twin is not a failure', () => {
   const c = summarizeChecks([ctx('test', 'COMPLETED', 'SUCCESS'), ctx('test', 'COMPLETED', 'CANCELLED'), ctx('rust', 'COMPLETED', 'SKIPPED')]);
-  assert.deepEqual(c, { state: 'pass', pass: 1, fail: 0, pending: 0, skipped: 1, failing: [], runs: [] });
+  assert.deepEqual(c, { state: 'pass', pass: 1, fail: 0, pending: 0, skipped: 1, failing: [], runs: [], failedJobs: [] });
 });
 
 test('pending wins over a finished twin; failures are named; status contexts count', () => {
@@ -107,4 +108,51 @@ test('a merge wakes unless auto-merge was queued for it; an awaited merge always
   assert.equal(diff(queued, merged, true)[0]!.wake, true, 'awaited');
   assert.equal(diff(normalize(pr(31)), merged)[0]!.wake, true, 'merged by someone, without auto-merge');
   assert.equal(diff(queued, normalize(pr(31, { state: 'CLOSED' })))[0]!.wake, true, 'a close is never expected');
+});
+
+test('failing jobs keep one link per check and run; a rerun that passes is not a failure', () => {
+  const job = (name: string, conclusion: string, run: number, id: number) => ({
+    __typename: 'CheckRun', name, status: 'COMPLETED', conclusion, detailsUrl: `https://github.com/o/r/actions/runs/${run}/job/${id}`,
+  });
+  const c = summarizeChecks([job('build', 'FAILURE', 7, 1), job('build', 'SUCCESS', 8, 2), job('lint', 'FAILURE', 7, 3), job('e2e', 'FAILURE', 7, 4)]);
+  assert.deepEqual(c.failing, ['e2e', 'lint']);
+  assert.deepEqual(c.failedJobs, [
+    { name: 'e2e', url: 'https://github.com/o/r/actions/runs/7/job/4' },
+    { name: 'lint', url: 'https://github.com/o/r/actions/runs/7/job/3' },
+  ]);
+  assert.deepEqual(c.runs, [7]);
+});
+
+test('a notice names up to three failing job links inline, then points at the list of the rest', () => {
+  const jobs = summarizeChecks(['a', 'b', 'c', 'd'].map((name, i) => ({
+    __typename: 'CheckRun', name, status: 'COMPLETED', conclusion: 'FAILURE', detailsUrl: `https://github.com/o/r/actions/runs/9/job/${i + 1}`,
+  })));
+  const link = (name: string, id: number) => `${name} https://github.com/o/r/actions/runs/9/job/${id}`;
+  assert.equal(jobsText(jobs, 'o/r', { pr: 5 }), `jobs: ${link('a', 1)} ; ${link('b', 2)} ; ${link('c', 3)} ; +1 more: gh pr checks 5 --repo o/r`);
+  assert.equal(jobsText(jobs, 'o/r', { branch: 'main' }), `jobs: ${link('a', 1)} ; ${link('b', 2)} ; ${link('c', 3)} ; +1 more: gh run list --branch main --repo o/r`);
+  assert.equal(jobsText(summarizeChecks([]), 'o/r', { pr: 1 }), undefined, 'nothing failing, nothing to link');
+  assert.equal(jobsText(summarizeChecks([{ name: 'x', status: 'COMPLETED', conclusion: 'FAILURE' }]), 'o/r', { pr: 1 }), undefined, 'a failure without a link adds no job line');
+});
+
+test('a title over 60 characters is cut and the PR link carries the rest; the head branch is shown', () => {
+  const s = normalize(pr(5, { title: `${'x'.repeat(59)}yz`, headRefName: 'feat/cut' }));
+  assert.equal(line(s), `#5 BLOCKED · checks pass 1✓ 0✗ 0… · 5aaaaaaa · feat/cut · dev · "${'x'.repeat(59)}…" https://github.com/o/r/pull/5`);
+  assert.equal(line(normalize(pr(6, { title: 'short' }))).endsWith('· dev · "short"'), true, 'a short title stays whole and no branch is invented');
+});
+
+test('routing: a merge this session made is ignored, a quiet change is a candidate, a repeated confirmation on the same head is not a second wake', () => {
+  const merged: WatchEvent = { pr: 1, kind: 'merged', text: 'merged abc', wake: true };
+  assert.deepEqual(routeEvent(merged, { ownMerge: true }), { route: 'ignore', reason: 'own-merge' });
+  assert.deepEqual(routeEvent(merged), { route: 'respond', reason: 'wake' }, 'a merge nobody here made still wakes');
+  assert.deepEqual(routeEvent({ ...merged, wake: false }), { route: 'candidate', reason: 'quiet' });
+
+  const cur = normalize(pr(1, { mergeStateStatus: 'BLOCKED' }));
+  const passed: WatchEvent = { pr: 1, kind: 'checks', text: 'checks passed 1/1', wake: true };
+  assert.deepEqual(routeEvent(passed, { cur }), { route: 'respond', reason: 'wake' }, 'nothing announced on this head yet');
+  const announced = announce(undefined, passed, cur);
+  assert.deepEqual(routeEvent(passed, { cur, announced }), { route: 'candidate', reason: 'repeat' });
+  const next = normalize(pr(1, { mergeStateStatus: 'BLOCKED', headRefOid: 'b'.repeat(40) }));
+  assert.deepEqual(routeEvent(passed, { cur: next, announced }), { route: 'respond', reason: 'wake' }, 'a new head is announced again');
+  const failed: WatchEvent = { pr: 1, kind: 'checks', text: 'checks failed: test', wake: true };
+  assert.deepEqual(routeEvent(failed, { cur: normalize(pr(1, {}, [['test', 'COMPLETED', 'FAILURE']])), announced }), { route: 'respond', reason: 'wake' }, 'a failure is never a repeat');
 });

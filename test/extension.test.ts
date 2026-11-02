@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import extension, { Lease, MESSAGE_TYPE } from '../src/index.ts';
+import { SUBSCRIBER_NOTICE_CHANNEL, type SubscriberNotice } from '../src/subscribers.ts';
 import { Store } from '../src/watcher.ts';
 import { commit, FakeGitHub, pr, tempDir } from './fixtures.ts';
 
@@ -12,17 +13,24 @@ function harness(mode = 'tui', dir = tempDir(), send?: () => void | Promise<void
   const timers: (() => void)[] = [];
   const warnings: string[] = [];
   let tool: { execute: (...a: unknown[]) => Promise<{ content: { text: string }[]; isError?: boolean }> } | undefined;
+  // The shared extension bus: a subscriber listens on a channel and may take a notice it is addressed to.
+  const bus = new Map<string, ((data: unknown) => void)[]>();
+  const events = {
+    emit: (channel: string, data: unknown) => { for (const h of bus.get(channel) ?? []) h(data); },
+    on: (channel: string, h: (data: unknown) => void) => { bus.set(channel, [...bus.get(channel) ?? [], h]); return () => {}; },
+  };
   const pi = {
     on: (name: string, h: Handler) => handlers.set(name, h),
     registerTool: (t: typeof tool) => { tool = t; },
     sendMessage: (message: { customType: string; content: string }, options: unknown) => { sent.push({ message, options }); return send?.(); },
+    events,
   };
   extension(pi as never, { run: gh.run, git: async args => args[0] === 'remote' ? 'https://github.com/o/r.git' : 'main', store: new Store(dir), schedule: fn => { timers.push(fn); return timers.length; }, cancel: () => {} });
   handlers.get('session_start')!({}, { mode, hasUI: true, ui: { notify: text => warnings.push(text) } });
   const call = (params: Record<string, unknown>) => tool!.execute('id', params, undefined, undefined, {});
   /** Runs the scheduled poll and waits for it to settle. */
   const fire = async () => { const fn = timers.shift(); assert.ok(fn, 'a poll is scheduled'); await fn(); };
-  return { gh, sent, timers, call, fire, handlers, dir, warnings };
+  return { gh, sent, timers, call, fire, handlers, dir, warnings, events };
 }
 
 test('a watched PR whose checks finish wakes the session with a steer message', async () => {
@@ -213,4 +221,85 @@ test('a merge queued with auto-merge is recorded for the next turn without wakin
   assert.match(status.content[0].text, /No repositories watched/);
   assert.match(status.content[0].text, /Host accepted: 1 wake requests, 1 next-turn notices; 0 uncertain/);
   assert.equal((await h.call({ action: 'watch', repo: 'o/r', awaitMerge: true })).isError, true, 'awaitMerge needs prs');
+});
+
+test('a subscriber takes its PR\'s notice from the event bus; the notices it does not take stay with this session', async () => {
+  const h = harness();
+  const taken: SubscriberNotice[] = [];
+  h.events.on(SUBSCRIBER_NOTICE_CHANNEL, data => {
+    const notice = data as SubscriberNotice;
+    if (notice.subscriber !== 'worker-1') return;
+    taken.push(notice);
+    notice.accept();
+  });
+  h.gh.set(pr(90, {}, [['test', 'IN_PROGRESS']]), pr(91, {}, [['test', 'IN_PROGRESS']]));
+  assert.equal((await h.call({ action: 'watch', repo: 'o/r', prs: [90], subscriber: 'worker-1' })).isError, undefined);
+  await h.call({ action: 'watch', repo: 'o/r', prs: [91] });
+  h.gh.set(pr(90, {}, [['test', 'COMPLETED', 'FAILURE']]), pr(91, {}, [['test', 'COMPLETED', 'FAILURE']]));
+  await h.fire();
+  assert.equal(taken.length, 1);
+  assert.match(taken[0].text, /#90 checks failed/);
+  assert.deepEqual(taken[0].events.map(e => e.pr), [90]);
+  assert.equal(h.sent.length, 1, 'only the notice of #91 reaches this session');
+  assert.match(h.sent[0].message.content, /#91 checks failed/);
+  assert.doesNotMatch(h.sent[0].message.content, /#90/);
+  assert.match((await h.call({ action: 'status', repo: 'o/r' })).content[0].text, /Subscribers \(all repos\): 1 notices taken by a subscriber, 0 handed back here/);
+});
+
+test('a notice no subscriber accepts comes back to this session, marked; a subscriber that throws does not lose it', async () => {
+  const h = harness();
+  h.gh.set(pr(92, {}, [['test', 'IN_PROGRESS']]));
+  await h.call({ action: 'watch', repo: 'o/r', prs: [92], subscriber: 'worker-1' });
+  h.gh.set(pr(92, {}, [['test', 'COMPLETED', 'FAILURE']]));
+  await h.fire();
+  assert.equal(h.sent.length, 1, 'no bus listener: the notice is handed back');
+  assert.match(h.sent[0].message.content, /#92 checks failed[\s\S]*\(For worker-1: no subscriber accepted it, so it is delivered here\.\)/);
+  assert.deepEqual(h.sent[0].options, { triggerTurn: true, deliverAs: 'steer' }, 'a failure still wakes the session');
+  assert.match((await h.call({ action: 'status', repo: 'o/r' })).content[0].text, /1 handed back here because none accepted/);
+
+  h.events.on(SUBSCRIBER_NOTICE_CHANNEL, () => { throw new Error('consumer crashed'); });
+  h.gh.set(pr(92, {}, [['test', 'IN_PROGRESS']]));
+  await h.fire();
+  h.gh.set(pr(92, {}, [['test', 'COMPLETED', 'FAILURE']]));
+  await h.fire();
+  assert.equal(h.sent.length, 2, 'the throwing consumer does not drop the failure');
+  assert.match(h.warnings.join('\n'), /subscriber worker-1 failed while taking a notice \(consumer crashed\)/);
+});
+
+test('a subscriber label is checked before any GitHub call', async () => {
+  const h = harness();
+  for (const [params, pattern] of [
+    [{ action: 'watch', repo: 'o/r', prs: [1], subscriber: 'bad label!' }, /subscriber must be up to 64/],
+    [{ action: 'watch', repo: 'o/r', subscriber: 'worker-1' }, /subscriber goes with watch and prs or branch/],
+    [{ action: 'status', repo: 'o/r', subscriber: 'worker-1' }, /subscriber goes with watch/],
+  ] as const) {
+    const r = await h.call(params);
+    assert.equal(r.isError, true);
+    assert.match(r.content[0].text, pattern);
+  }
+  assert.equal(h.gh.calls.length, 0);
+});
+
+test('a child session merging a PR does not mark it as its own: the polling session still hears about the merge', async () => {
+  const parent = harness();
+  const child = harness('json', parent.dir);
+  parent.gh.set(pr(102, { mergeStateStatus: 'CLEAN' }));
+  await parent.call({ action: 'watch', repo: 'o/r', prs: [102] });
+  await child.handlers.get('tool_result')!({ toolName: 'bash', isError: false, input: { command: 'gh pr merge 102 --repo o/r --squash' }, content: [] }, { mode: 'json', cwd: child.dir });
+  parent.gh.set(pr(102, { state: 'MERGED', mergeCommit: { oid: 'cccc00112233' } }));
+  await parent.fire();
+  assert.equal(parent.sent.length, 1, 'the merge is not the parent\'s own: it wakes');
+  assert.match(parent.sent[0].message.content, /#102 merged cccc0011/);
+});
+
+test('a merge this session makes with gh pr merge is recorded from bash: its own notice does not wake the agent', async () => {
+  const h = harness();
+  h.gh.set(pr(100, { mergeStateStatus: 'CLEAN' }), pr(101, { mergeStateStatus: 'CLEAN' }));
+  await h.call({ action: 'watch', repo: 'o/r', prs: [100, 101] });
+  await h.handlers.get('tool_result')!({ toolName: 'bash', isError: false, input: { command: 'gh pr merge 100 --repo o/r --squash' }, content: [] }, { mode: 'tui', cwd: h.dir });
+  h.gh.set(pr(100, { state: 'MERGED', mergeCommit: { oid: 'aaaa00112233' } }), pr(101, { state: 'MERGED', mergeCommit: { oid: 'bbbb00112233' } }));
+  await h.fire();
+  assert.equal(h.sent.length, 1);
+  assert.match(h.sent[0].message.content, /#101 merged bbbb0011/);
+  assert.doesNotMatch(h.sent[0].message.content, /#100/);
 });

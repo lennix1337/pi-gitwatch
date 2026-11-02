@@ -1,23 +1,34 @@
 /** GitHub pull-request state reduced to the fields that decide what to do next, and the transitions worth reporting. */
 
 export type ChecksState = 'none' | 'pending' | 'pass' | 'fail';
+/** A failing check with the link to its job (or external status), so a notice can name it without a query. */
+export interface FailedJob { name: string; url?: string }
 export interface Checks {
   state: ChecksState; pass: number; fail: number; pending: number; skipped: number; failing: string[];
   /** GitHub Actions run ids of the failing checks, for `gh run view <id> --log-failed`. */
   runs: number[];
+  /** The failing checks, one per name and link, in name order. */
+  failedJobs: FailedJob[];
 }
+/** The slots whose last announced value decides whether a repeated confirmation is news. */
+export type Slot = 'checks' | 'mergeState';
+export type Announced = Partial<Record<Slot, string>>;
 export interface Snapshot {
   number: number; title: string; url: string; author: string;
   state: 'OPEN' | 'MERGED' | 'CLOSED'; draft: boolean;
   /** GitHub mergeStateStatus: CLEAN, BLOCKED, DIRTY, UNSTABLE, BEHIND, HAS_HOOKS, DRAFT or UNKNOWN (still computing). */
   mergeState: string;
   review: string | null; head: string; auto: boolean; mergeCommit: string | null; checks: Checks;
+  /** The head branch, so a notice names what to check out. Absent in snapshots saved before it was read. */
+  branch?: string;
+  /** The checks and merge state (with the head) the agent was last told about on this PR. */
+  announced?: Announced;
   /** When checks were first seen passing on this head with auto-merge on, and whether the stall was reported. */
   passedAt?: number; stallReported?: boolean;
 }
 /** The latest commit of a watched branch: its CI is reported once when it finishes, then the branch watch ends. */
 export interface BranchSnapshot { branch: string; head: string; headline: string; checks: Checks; reported: boolean }
-export type EventKind = 'opened' | 'merged' | 'closed' | 'reopened' | 'push' | 'checks' | 'mergeState' | 'review' | 'ready' | 'draft' | 'stall';
+export type EventKind = 'opened' | 'merged' | 'closed' | 'reopened' | 'push' | 'checks' | 'mergeState' | 'review' | 'ready' | 'draft' | 'stall' | 'cleanup';
 /** `pr` is 0 for branch and watcher events; `branch` names the branch of a branch event. */
 /** `head` is the merged commit of a `merged` event's PR head, so local branches still pointing at it can be cleaned. */
 export interface WatchEvent { pr: number; branch?: string; kind: EventKind; text: string; wake: boolean; head?: string }
@@ -29,7 +40,7 @@ interface RawContext {
 export interface RawCommit { oid: string; messageHeadline: string; statusCheckRollup: { contexts: { nodes: RawContext[] } } | null }
 export interface RawPullRequest {
   number: number; title: string; url: string; state: string; isDraft: boolean; mergeStateStatus: string; reviewDecision: string | null;
-  headRefOid: string; author: { login: string } | null; autoMergeRequest: unknown; mergeCommit: { oid: string } | null;
+  headRefOid: string; headRefName?: string; author: { login: string } | null; autoMergeRequest: unknown; mergeCommit: { oid: string } | null;
   commits?: { nodes: { commit: { statusCheckRollup: { contexts: { nodes: RawContext[] } } | null } }[] };
 }
 
@@ -55,11 +66,24 @@ function failedRuns(contexts: RawContext[], failing: string[]): number[] {
   return [...new Set(runs.filter((id): id is number => id !== undefined))].sort((a, b) => a - b);
 }
 
+/** The failing checks with the link to each one's job, one per name and link, in name order. */
+function failedJobs(contexts: RawContext[], failing: string[]): FailedJob[] {
+  const jobs = new Map<string, FailedJob>();
+  for (const c of contexts) {
+    const name = c.name ?? c.context ?? '?';
+    if (!failing.includes(name) || verdict(c) !== 'fail') continue;
+    const url = c.detailsUrl ?? c.targetUrl ?? undefined;
+    jobs.set(`${name}\n${url ?? ''}`, { name, ...url ? { url } : {} });
+  }
+  const byName = (a: FailedJob, b: FailedJob) => (a.name < b.name ? -1 : a.name > b.name ? 1 : (a.url ?? '') < (b.url ?? '') ? -1 : (a.url ?? '') > (b.url ?? '') ? 1 : 0);
+  return [...jobs.values()].sort(byName);
+}
+
 /** One verdict per check name: a rerun or a duplicate workflow cancelled next to a passing twin is not a failure. */
 export function summarizeChecks(contexts: RawContext[]): Checks {
   const byName = new Map<string, Verdict[]>();
   for (const c of contexts) byName.set(c.name ?? c.context ?? '?', [...byName.get(c.name ?? c.context ?? '?') ?? [], verdict(c)]);
-  const checks: Checks = { state: 'none', pass: 0, fail: 0, pending: 0, skipped: 0, failing: [], runs: [] };
+  const checks: Checks = { state: 'none', pass: 0, fail: 0, pending: 0, skipped: 0, failing: [], runs: [], failedJobs: [] };
   for (const [name, verdicts] of byName) {
     if (verdicts.includes('pending')) checks.pending++;
     else if (verdicts.includes('pass')) checks.pass++;
@@ -68,6 +92,7 @@ export function summarizeChecks(contexts: RawContext[]): Checks {
   }
   checks.failing.sort();
   checks.runs = failedRuns(contexts, checks.failing);
+  checks.failedJobs = failedJobs(contexts, checks.failing);
   checks.state = checks.pending > 0 ? 'pending' : checks.fail > 0 ? 'fail' : checks.pass > 0 ? 'pass' : 'none';
   return checks;
 }
@@ -78,6 +103,7 @@ export function normalize(raw: RawPullRequest): Snapshot {
   return {
     number: raw.number, title: raw.title, url: raw.url, author: raw.author?.login ?? 'ghost', state, draft: raw.isDraft,
     mergeState: raw.mergeStateStatus, review: raw.reviewDecision, head: raw.headRefOid.slice(0, 8), auto: raw.autoMergeRequest != null,
+    ...raw.headRefName ? { branch: raw.headRefName } : {},
     mergeCommit: raw.mergeCommit?.oid.slice(0, 8) ?? null, checks: summarizeChecks(rollup?.contexts.nodes ?? []),
   };
 }
@@ -190,12 +216,27 @@ export function branchHint(s: BranchSnapshot, repo: string): string | undefined 
   return s.checks.state === 'fail' && s.checks.pending === 0 ? failingLog(s.checks, repo) : undefined;
 }
 
-/** One compact line per PR: the fields that decide the next action. */
+/** Titles longer than this are cut in a notice; the PR URL is the pointer to the rest. */
+const TITLE_CHARS = 60;
+
+/** One compact line per PR: the fields that decide the next action; the title's pointer when it was cut. */
 export function line(s: Snapshot): string {
   const checks = checksText(s.checks);
   const flags = [s.draft && 'draft', s.auto && 'auto-merge', s.review && s.review.toLowerCase()].filter(Boolean).join(' ');
   const state = s.state === 'OPEN' ? s.mergeState : `${s.state}${s.mergeCommit ? ` ${s.mergeCommit}` : ''}`;
-  return `#${s.number} ${state} · ${checks}${flags ? ` · ${flags}` : ''} · ${s.head} · ${s.author} · "${short(s.title)}"`;
+  const title = s.title.length > TITLE_CHARS ? `"${short(s.title, TITLE_CHARS)}" ${s.url}` : `"${s.title}"`;
+  return `#${s.number} ${state} · ${checks}${flags ? ` · ${flags}` : ''} · ${s.head}${s.branch ? ` · ${s.branch}` : ''} · ${s.author} · ${title}`;
+}
+
+/** Failing job links shown inline in a notice or status line; the rest spill to the command that lists them. */
+export const MAX_INLINE_JOBS = 3;
+export function jobsText(c: Checks, repo: string, target: { pr: number } | { branch: string }): string | undefined {
+  const linked = c.failedJobs.filter(j => j.url);
+  if (!linked.length) return undefined;
+  const inline = linked.slice(0, MAX_INLINE_JOBS);
+  const more = c.failedJobs.length - inline.length;
+  const list = 'pr' in target ? `gh pr checks ${target.pr} --repo ${repo}` : `gh run list --branch ${target.branch} --repo ${repo}`;
+  return `jobs: ${inline.map(j => `${j.name} ${j.url}`).join(' ; ')}${more > 0 ? ` ; +${more} more: ${list}` : ''}`;
 }
 
 /** What the agent probably does next for a PR in this state; omitted when nothing is actionable. */

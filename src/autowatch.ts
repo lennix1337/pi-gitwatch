@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { isAbsolute, resolve } from 'node:path';
-import { BRANCH } from './github.ts';
+import { BRANCH, REPO } from './github.ts';
 
 /** Runs `git` in `cwd` and resolves its trimmed stdout. Injected in tests. */
 export type GitRunner = (args: string[], cwd: string) => Promise<string>;
@@ -54,6 +54,41 @@ export function pushes(command: string, cwd: string): Push[] {
       const push = gitPush(words, dir);
       if (push) found.push(push);
     }
+  }
+  return found;
+}
+
+/** A PR a shell command merged with `gh pr merge` (not queued with `--auto`), the repository it names, and where it ran. */
+export interface OwnMerge { pr: number; repo?: string; dir: string }
+/** `gh pr merge` options that take a value, so the value is not read as the PR. */
+const MERGE_WITH_VALUE = new Set(['-b', '--body', '-F', '--body-file', '-t', '--subject', '-A', '--author-email', '--match-head-commit']);
+
+/**
+ * The PRs a shell command merged right now with `gh pr merge`; `--auto` is skipped because it only queues the merge.
+ * A merge made through the web or another tool is not seen here.
+ */
+export function ownMerges(command: string, cwd: string): OwnMerge[] {
+  const found: OwnMerge[] = [];
+  let dir = cwd;
+  for (const segment of command.split(/&&|\|\||[;|\n]/)) {
+    const words = tokens(segment);
+    if (words[0] === 'cd' && words[1]) dir = within(dir, words[1]);
+    if (words[0] !== 'gh' || words[1] !== 'pr' || words[2] !== 'merge') continue;
+    let auto = false, flagRepo: string | undefined, target: string | undefined;
+    for (let i = 3; i < words.length; i++) {
+      const w = words[i];
+      if (w === '--auto') auto = true;
+      else if (w === '-R' || w === '--repo') flagRepo = words[++i];
+      else if (w.startsWith('--repo=')) flagRepo = w.slice('--repo='.length);
+      else if (MERGE_WITH_VALUE.has(w)) i++;
+      else if (!w.startsWith('-') && target === undefined) target = w;
+    }
+    if (auto || target === undefined) continue;
+    const url = /github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/pull\/(\d+)/.exec(target);
+    const pr = url ? Number(url[2]) : /^\d+$/.test(target) ? Number(target) : undefined;
+    if (pr === undefined) continue;
+    const repo = flagRepo && REPO.test(flagRepo) ? flagRepo : url?.[1];
+    found.push({ pr, ...repo ? { repo } : {}, dir });
   }
   return found;
 }

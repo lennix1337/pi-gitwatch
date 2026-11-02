@@ -4,7 +4,7 @@ import { existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { gitRunner } from '../src/autowatch.ts';
-import { cleanMerged, cleanupNote } from '../src/cleanup.ts';
+import { cleanMerged, cleanupLines } from '../src/cleanup.ts';
 import { tempDir } from './fixtures.ts';
 
 /** A real repository: `main`, a merged branch `done` (plain, and a clean worktree `wt-done`), a dirty worktree and later work. */
@@ -48,17 +48,20 @@ test('long-lived branches are never removed, even at the merged head', async () 
   assert.match(git('branch', '--list', 'develop'), /develop/);
 });
 
-test('the note names the PR and is empty without a clone or merged event', async () => {
+test('the cleanup lines name the PR and are empty without a clone or merged event', async () => {
   const { dir, head } = repo();
-  assert.equal(await cleanupNote(gitRunner, { events: [{ kind: 'merged', pr: 3, head }] }), '');
-  assert.equal(await cleanupNote(gitRunner, { clone: dir, events: [{ kind: 'checks', pr: 3, head }] }), '');
+  assert.deepEqual(await cleanupLines(gitRunner, { events: [{ kind: 'merged', pr: 3, head }] }), []);
+  assert.deepEqual(await cleanupLines(gitRunner, { clone: dir, events: [{ kind: 'checks', pr: 3, head }] }), []);
   // Snapshots keep an 8-character head: git resolves the abbreviation.
-  const note = await cleanupNote(gitRunner, { clone: dir, events: [{ kind: 'merged', pr: 3, head: head.slice(0, 8) }] });
-  assert.match(note, /^\nLocal cleanup in .*: #3 removed branch done; #3 kept wt-dirty: .*untracked files.*; #3 removed worktree .* and branch wt-done\.$/);
+  const lines = await cleanupLines(gitRunner, { clone: dir, events: [{ kind: 'merged', pr: 3, head: head.slice(0, 8) }] });
+  assert.deepEqual(lines.map(l => l.pr), [3, 3, 3]);
+  assert.match(lines[0].text, /^removed branch done$/);
+  assert.match(lines[1].text, /^kept wt-dirty: .*untracked files/);
+  assert.match(lines[2].text, /^removed worktree .* and branch wt-done$/);
 });
 
 test('a clone the agent already removed leaves no "spawn git ENOENT" note', async () => {
   const { dir, head } = repo();
   const gone = join(dir, 'worktrees', 'already-removed');
-  assert.equal(await cleanupNote(gitRunner, { clone: gone, events: [{ kind: 'merged', pr: 4, head }] }), '');
+  assert.deepEqual(await cleanupLines(gitRunner, { clone: gone, events: [{ kind: 'merged', pr: 4, head }] }), []);
 });
