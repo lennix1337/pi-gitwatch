@@ -80,6 +80,34 @@ test('an open watch picks up new PRs without waking for them alone, and unwatche
   assert.deepEqual(Object.keys(watcher.state().repos['o/r'].snapshots), ['1']);
 });
 
+test('a PR added to an open watch is forgotten after its merge, not announced as opened on every poll', async () => {
+  const { gh, watcher, tick } = setup();
+  gh.set(pr(1), pr(5));
+  await watcher.watch('o/r');
+  await watcher.watch('o/r', { prs: [5] });
+  gh.set(pr(1), pr(5, { state: 'MERGED', mergeCommit: { oid: 'abcdef123456' } }));
+  const merged = await watcher.poll();
+  assert.deepEqual(merged.events.get('o/r')!.map(e => [e.pr, e.kind]), [[5, 'merged']]);
+  assert.deepEqual(watcher.state().repos['o/r'].prs, [], 'the merged PR leaves the watch list');
+  for (let i = 0; i < 3; i++) {
+    tick();
+    const later = await watcher.poll();
+    assert.deepEqual(later.events.get('o/r'), [], 'nothing new after the merge');
+  }
+  assert.equal(watcher.state().repos['o/r'].held, undefined);
+});
+
+test('a closed PR seen for the first time is not announced as opened', async () => {
+  const { gh, watcher } = setup();
+  gh.set(pr(1));
+  await watcher.watch('o/r');
+  const state = watcher.state();
+  state.repos['o/r'].prs = [7];
+  watcher.store.save(state);
+  gh.set(pr(1), pr(7, { state: 'MERGED' }));
+  assert.deepEqual((await watcher.poll()).events.get('o/r'), []);
+});
+
 test('a watch on a missing PR fails before saving anything', async () => {
   const { gh, watcher } = setup();
   gh.set(pr(1));

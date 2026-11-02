@@ -125,7 +125,8 @@ const MERGE_STATE_TEXT: Record<string, string> = {
  */
 export function diff(prev: Snapshot | undefined, cur: Snapshot, awaited = false): WatchEvent[] {
   const pr = cur.number;
-  if (!prev) return [{ pr, kind: 'opened', text: `opened by ${cur.author}`, wake: false }];
+  // A PR first seen already merged or closed has nothing to announce: it was not opened under this watch.
+  if (!prev) return cur.state === 'OPEN' ? [{ pr, kind: 'opened', text: `opened by ${cur.author}`, wake: false }] : [];
   if (cur.state !== prev.state) {
     if (cur.state === 'MERGED') return [{ pr, kind: 'merged', text: `merged${cur.mergeCommit ? ` ${cur.mergeCommit}` : ''}`, wake: awaited || !prev.auto, head: cur.head }];
     if (cur.state === 'CLOSED') return [{ pr, kind: 'closed', text: 'closed without merge', wake: true }];

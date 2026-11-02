@@ -383,7 +383,8 @@ export class Watcher {
    */
   private prune(watch: RepoWatch, branches = false) {
     for (const [n, s] of Object.entries(watch.snapshots)) if (s.state !== 'OPEN') delete watch.snapshots[n];
-    if (watch.mode === 'list') watch.prs = watch.prs.filter(n => watch.snapshots[n]);
+    // Named PRs that are no longer open leave the list in both modes; an open watch kept them and re-read them forever.
+    watch.prs = watch.prs.filter(n => watch.snapshots[n]);
     pruneAwaited(watch);
     if (branches && watch.branches) {
       for (const [name, s] of Object.entries(watch.branches)) if (s.reported) delete watch.branches[name];
