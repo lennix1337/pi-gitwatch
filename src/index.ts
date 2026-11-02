@@ -2,10 +2,11 @@ import { readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
-import { createdPrs, gitRunner, pushes, resolvePush, type GitRunner } from './autowatch.ts';
-import { cleanupNote } from './cleanup.ts';
+import { createdPrs, githubRepo, gitRunner, ownMerges, pushes, resolvePush, type GitRunner } from './autowatch.ts';
+import { cleanupLines } from './cleanup.ts';
 import { BRANCH, ghRunner, MAX_PRS, REPO, type Runner } from './github.ts';
 import { statusText, Store, Watcher, watchPush, type Notice } from './watcher.ts';
+import { SUBSCRIBER, SUBSCRIBER_NOTICE_CHANNEL, type SubscriberNotice } from './subscribers.ts';
 
 export const MESSAGE_TYPE = 'gitwatch';
 const actions = ['status', 'watch', 'unwatch'] as const;
@@ -92,12 +93,32 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
     move({ phase: 'waiting', timer });
   };
 
+  /** Local cleanup of merged PRs: its lines are reported with the merge, in the same poll. */
+  const cleanup = (notice: { clone: string; events: Notice['events'] }) => cleanupLines(git, notice);
+
+  /**
+   * A notice of a subscriber goes on the event bus first; a consumer that accepts it owns it. Otherwise (no consumer, or
+   * none accepted) it is handed back to this session, which is the default route.
+   */
+  const claimForSubscriber = (label: string, notice: Notice): boolean => {
+    const claim: SubscriberNotice = { subscriber: label, repo: notice.repo, wake: notice.wake, text: notice.text, events: notice.events, accepted: false, accept() { claim.accepted = true; } };
+    try { pi.events.emit(SUBSCRIBER_NOTICE_CHANNEL, claim); }
+    catch (error) { warn?.(`Gitwatch: subscriber ${label} failed while taking a notice (${error instanceof Error ? error.message : String(error)}); the notice stays here.`); }
+    return claim.accepted;
+  };
+
   // A notice that needs the agent wakes it; an expected merge only waits for its next turn (no model call).
   const deliver = async (notice: Notice) => {
+    if (notice.subscriber) {
+      const claimed = claimForSubscriber(notice.subscriber, notice);
+      await watcher.recordSubscriber(claimed);
+      if (claimed) return;
+    }
+    const text = notice.subscriber ? `${notice.text}\n(For ${notice.subscriber}: no subscriber accepted it, so it is delivered here.)` : notice.text;
     let accepted = false;
     try {
       await pi.sendMessage(
-        { customType: MESSAGE_TYPE, content: notice.text, display: true, details: { repo: notice.repo, events: notice.events } },
+        { customType: MESSAGE_TYPE, content: text, display: true, details: { repo: notice.repo, events: notice.events } },
         notice.wake ? { triggerTurn: true, deliverAs: 'steer' } : { deliverAs: 'nextTurn' },
       );
       accepted = true;
@@ -112,8 +133,7 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
     const interval = state.intervalSec * 1000;
     try {
       if (Object.keys(state.repos).length && lease.acquire(now(), interval * 3)) {
-        const { notices } = await watcher.poll();
-        for (const n of notices) n.text += await cleanupNote(git, n);
+        const { notices } = await watcher.poll(undefined, undefined, { cleanup });
         for (const n of notices) { if (mine !== epoch) break; await deliver(n); }
       }
     } catch { warn?.('Gitwatch: polling or local delivery evidence could not be completed. Inspect gitwatch status and local state before retrying.'); }
@@ -134,8 +154,12 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
     start();
   });
   pi.on('session_shutdown', stop);
-  // Only the polling (interactive) session follows its own pushes; a child's push is its parent's to watch.
+  // Only the polling (interactive) session follows its own pushes and merges; a child's push or merge is its parent's to watch.
   pi.on('tool_result', async (event, ctx) => {
+    if (loop.phase !== 'stopped') {
+      try { await noteOwnMerges(event as BashResult, watcher, git, ctx.cwd); }
+      catch (error) { warn?.(`Gitwatch: could not record a merge made here (${error instanceof Error ? error.message : String(error)}); its notice may still wake the agent.`); }
+    }
     const note = loop.phase !== 'stopped' ? await noteAfterBash(event as BashResult, watcher, git, ctx.cwd) : undefined;
     return note ? { content: [...event.content, { type: 'text' as const, text: note }] } : undefined;
   });
@@ -150,6 +174,7 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
       branch: Type.Optional(Type.String({ pattern: BRANCH.source, description: 'Follow the CI of this branch\'s latest commit (a direct push) until it finishes.' })),
       intervalSec: Type.Optional(Type.Integer({ minimum: 10, maximum: 600, description: 'Poll interval for all watches, default 30.' })),
       awaitMerge: Type.Optional(Type.Boolean({ description: 'With prs: wake me when they merge even under auto-merge (work waits on it).' })),
+      subscriber: Type.Optional(Type.String({ pattern: SUBSCRIBER.source, description: 'With prs or branch: the notices of those go to this subscriber label (a subagent) when it takes them; if none does, they come here. Unwatch and watch again to return them here.' })),
     }, { additionalProperties: false }),
     async execute(_id, params, signal) {
       const action = params.action ?? 'status';
@@ -157,7 +182,7 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
         validate(action, params);
         validateAwait(action, params);
         if (action === 'watch') {
-          await watcher.watch(params.repo!, { prs: params.prs, branch: params.branch, intervalSec: params.intervalSec, awaitMerge: params.awaitMerge });
+          await watcher.watch(params.repo!, { prs: params.prs, branch: params.branch, intervalSec: params.intervalSec, awaitMerge: params.awaitMerge, subscriber: params.subscriber });
           start();
           return reply(statusText(watcher.state(), new Map(), params.repo, now()));
         }
@@ -170,7 +195,7 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
         const before = watcher.state();
         if (params.repo && !before.repos[params.repo]) return reply(statusText(before, new Map(), params.repo, now()));
         // Changes found by this refresh are shown here, so they are not announced again.
-        const { events } = Object.keys(before.repos).length ? await watcher.poll(params.repo, signal) : { events: new Map() };
+        const { events } = Object.keys(before.repos).length ? await watcher.poll(params.repo, signal, { deliver: false, cleanup }) : { events: new Map() };
         return reply(statusText(watcher.state(), events, params.repo, now()));
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -182,7 +207,7 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
 
 const reply = (text: string) => ({ content: [{ type: 'text' as const, text }], details: {} });
 
-interface Params { action?: string; repo?: string; prs?: number[]; branch?: string; intervalSec?: number; awaitMerge?: boolean }
+interface Params { action?: string; repo?: string; prs?: number[]; branch?: string; intervalSec?: number; awaitMerge?: boolean; subscriber?: string }
 
 /** Rejects a call before any GitHub request, with the corrective hint. */
 function validate(action: string, params: Params) {
@@ -197,9 +222,27 @@ function validate(action: string, params: Params) {
 
 function validateAwait(action: string, params: Params) {
   if (params.awaitMerge !== undefined && (action !== 'watch' || !params.prs)) throw new Error('awaitMerge goes with watch and prs: the PRs whose merge you wait on.');
+  if (params.subscriber === undefined) return;
+  if (action !== 'watch' || (!params.prs && params.branch === undefined)) throw new Error('subscriber goes with watch and prs or branch: the PRs or branch whose notices that subscriber takes.');
+  if (!SUBSCRIBER.test(params.subscriber)) throw new Error('subscriber must be up to 64 letters, digits, dots, colons, underscores or dashes.');
 }
 
 interface BashResult { toolName: string; isError: boolean; input: Record<string, unknown>; content: ({ type: 'text'; text: string } | { type: 'image' })[] }
+
+/**
+ * Records the PRs a successful bash command merged with `gh pr merge` (not `--auto`) in the repository it names, or in the
+ * clone it ran in, when that repository is watched.
+ */
+export async function noteOwnMerges(event: BashResult, watcher: Watcher, git: GitRunner, cwd: string): Promise<void> {
+  if (event.toolName !== 'bash' || event.isError) return;
+  const command = typeof event.input.command === 'string' ? event.input.command : '';
+  if (!/\bgh\s+pr\s+merge\b/.test(command)) return;
+  for (const merge of ownMerges(command, cwd)) {
+    // A clone without an origin remote names no GitHub repository: there is nothing to record.
+    const repo = merge.repo ?? githubRepo(await git(['remote', 'get-url', 'origin'], merge.dir).catch(() => ''));
+    if (repo) await watcher.noteOwnMerge(repo, merge.pr);
+  }
+}
 
 /** The note `autoWatch` appends to a successful bash command that pushed or created a PR, or undefined. */
 export async function noteAfterBash(event: BashResult, watcher: Watcher, git: GitRunner, cwd: string): Promise<string | undefined> {

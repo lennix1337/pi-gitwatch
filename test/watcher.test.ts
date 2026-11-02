@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
-import { writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import type { Runner } from '../src/github.ts';
+import { type Runner, query } from '../src/github.ts';
+import type { RawPullRequest } from '../src/model.ts';
 import { FAILURES_BEFORE_NOTICE, statusText, Store, Watcher, watchPush } from '../src/watcher.ts';
 import { commit, FakeGitHub, pr, tempDir } from './fixtures.ts';
 
@@ -278,4 +279,178 @@ test('a failing repository is counted on its own while the others in the same po
   assert.match(notices[1].text, /o\/bad[\s\S]*Polling failed 3 times in a row: HTTP 502/);
   assert.equal(watcher.state().repos['o/good'].failures, 0);
   assert.equal(watcher.state().repos['o/bad'].failures, FAILURES_BEFORE_NOTICE);
+});
+
+/** A PR whose checks carry job links, as GitHub's rollup gives them: each job has its own run and job id. */
+const jobsPr = (n: number, over: Partial<RawPullRequest>, jobs: { name: string; status: string; conclusion: string | null; run: number; job: number }[]) => pr(n, {
+  ...over,
+  commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: jobs.map(j => ({ __typename: 'CheckRun', name: j.name, status: j.status, conclusion: j.conclusion, detailsUrl: `https://github.com/o/r/actions/runs/${j.run}/job/${j.job}` })) } } } }] },
+}, []);
+
+test('a failing check names its job links in the notice, and status keeps them', async () => {
+  const { gh, watcher, tick } = setup();
+  gh.set(jobsPr(60, {}, [{ name: 'unit', status: 'IN_PROGRESS', conclusion: null, run: 60, job: 1 }, { name: 'e2e', status: 'IN_PROGRESS', conclusion: null, run: 60, job: 2 }]));
+  await watcher.watch('o/r', { prs: [60] });
+  tick();
+  gh.set(jobsPr(60, { mergeStateStatus: 'BLOCKED' }, [{ name: 'unit', status: 'COMPLETED', conclusion: 'FAILURE', run: 61, job: 3 }, { name: 'e2e', status: 'COMPLETED', conclusion: 'FAILURE', run: 61, job: 4 }]));
+  const { notices } = await watcher.poll();
+  assert.deepEqual(notices.map(n => n.wake), [true]);
+  assert.match(notices[0].text, /#60 checks failed: e2e, unit\n {2}#60 BLOCKED · checks fail 0✓ 2✗ 0… \[e2e, unit\]/);
+  assert.match(notices[0].text, /\n {2}jobs: e2e https:\/\/github\.com\/o\/r\/actions\/runs\/61\/job\/4 ; unit https:\/\/github\.com\/o\/r\/actions\/runs\/61\/job\/3\n/);
+  assert.match(statusText(watcher.state(), new Map(), 'o/r', 0), /jobs: e2e https:\/\/github\.com\/o\/r\/actions\/runs\/61\/job\/4/);
+});
+
+test('a CI rerun that passes again on an announced head is a candidate, not a second turn', async () => {
+  const { gh, watcher, tick } = setup();
+  gh.set(pr(2, { mergeStateStatus: 'BLOCKED' }, [['test', 'IN_PROGRESS']]));
+  await watcher.watch('o/r', { prs: [2] });
+  gh.set(pr(2, { mergeStateStatus: 'CLEAN' }));
+  assert.deepEqual((await watcher.poll()).notices.map(n => n.wake), [true], 'first pass: the agent hears it');
+  gh.set(pr(2, { mergeStateStatus: 'BLOCKED' }, [['test', 'IN_PROGRESS']])); tick();
+  assert.deepEqual((await watcher.poll()).notices, [], 'a rerun starts quietly');
+  gh.set(pr(2, { mergeStateStatus: 'CLEAN' })); tick();
+  assert.deepEqual((await watcher.poll()).notices, [], 'the same head is already known to the agent');
+});
+
+test('a quiet change waits for the next wake, is shown there once, and is not sent alone', async () => {
+  const { gh, watcher, tick } = setup();
+  gh.set(pr(3, { mergeStateStatus: 'CLEAN' }));
+  await watcher.watch('o/r', { prs: [3] });
+  gh.set(pr(3, { mergeStateStatus: 'BLOCKED' }, [['test', 'IN_PROGRESS']])); tick();
+  assert.deepEqual((await watcher.poll()).notices, [], 'a quiet change is not sent by itself');
+  assert.match(JSON.stringify(watcher.state().repos['o/r'].held), /checks running \(1 pending\)/);
+  gh.set(pr(3, { mergeStateStatus: 'DIRTY' }, [['test', 'IN_PROGRESS']])); tick();
+  const { notices } = await watcher.poll();
+  assert.deepEqual(notices.map(n => n.wake), [true]);
+  assert.match(notices[0].text, /#3 merge conflict with base \(DIRTY\)/);
+  assert.match(notices[0].text, /since last notice: #3 checks running \(1 pending\)/);
+  assert.equal(watcher.state().repos['o/r'].held, undefined);
+  assert.deepEqual((await watcher.poll()).notices, [], 'shown once');
+});
+
+test('a held change older than 30 minutes goes out as a quiet notice, once', async () => {
+  const { gh, watcher, tick } = setup();
+  gh.set(pr(4, {}, [['test', 'COMPLETED', 'SUCCESS']]));
+  await watcher.watch('o/r', { prs: [4] });
+  gh.set(pr(4, {}, [['test', 'IN_PROGRESS']])); tick();
+  assert.deepEqual((await watcher.poll()).notices, []);
+  for (let i = 0; i < 61; i++) tick();
+  const { notices } = await watcher.poll();
+  assert.deepEqual(notices.map(n => n.wake), [false]);
+  assert.match(notices[0].text, /since last notice: #4 checks running/);
+  assert.deepEqual((await watcher.poll()).notices, []);
+});
+
+test('held changes are bounded: the oldest beyond 40 are counted, not kept, and the wake says so', async () => {
+  const { gh, watcher, tick } = setup();
+  const check = (n: number, status: string, conclusion: string | null) => pr(n, {}, [['test', status, conclusion]]);
+  const nums = Array.from({ length: 45 }, (_, i) => i + 1);
+  gh.set(...nums.map(n => check(n, 'COMPLETED', 'SUCCESS')), check(46, 'IN_PROGRESS', null));
+  await watcher.watch('o/r', { prs: [...nums, 46] });
+  gh.set(...nums.map(n => check(n, 'IN_PROGRESS', null))); tick();
+  assert.deepEqual((await watcher.poll()).notices, [], 'forty-five quiet changes are held');
+  gh.set(check(46, 'COMPLETED', 'FAILURE')); tick();
+  const { notices } = await watcher.poll();
+  assert.deepEqual(notices.map(n => n.wake), [true]);
+  assert.match(notices[0].text, /since last notice: .*\+32 more \(gitwatch \{"action":"status","repo":"o\/r"\}\); 5 earlier omitted/);
+});
+
+test('an expected merge sends what waited for the next turn, quietly', async () => {
+  const { gh, watcher, tick } = setup();
+  gh.set(pr(5, {}, [['test', 'COMPLETED', 'SUCCESS']]), pr(6, { autoMergeRequest: {} }, [['test', 'IN_PROGRESS']]));
+  await watcher.watch('o/r', { prs: [5] });
+  await watcher.watch('o/r', { prs: [6] });
+  gh.set(pr(5, {}, [['test', 'IN_PROGRESS']])); tick();
+  assert.deepEqual((await watcher.poll()).notices, []);
+  gh.set(pr(5, {}, [['test', 'IN_PROGRESS']]), pr(6, { state: 'MERGED', autoMergeRequest: {}, mergeCommit: { oid: 'cafe00112233' } })); tick();
+  const { notices } = await watcher.poll();
+  assert.deepEqual(notices.map(n => n.wake), [false]);
+  assert.match(notices[0].text, /#6 merged cafe0011/);
+  assert.match(notices[0].text, /since last notice: #5 checks running \(1 pending\)/);
+});
+
+test('a merge this session made itself is ignored: no notice, counted as ignored; another merge still wakes', async () => {
+  const { gh, watcher, tick } = setup();
+  gh.set(pr(70, { mergeStateStatus: 'CLEAN' }), pr(71, { mergeStateStatus: 'CLEAN' }), pr(72));
+  await watcher.watch('o/r', { prs: [70, 71, 72] });
+  assert.equal(await watcher.noteOwnMerge('o/r', 70), true);
+  gh.set(pr(70, { state: 'MERGED', mergeCommit: { oid: 'aaaaaa123456' } }), pr(71, { state: 'MERGED', mergeCommit: { oid: 'bbbbbb123456' } }), pr(72)); tick();
+  const { notices } = await watcher.poll();
+  assert.deepEqual(notices.map(n => [n.wake, n.events.map(e => e.pr)]), [[true, [71]]], "#70 is the agent's own merge; #71 is not");
+  const state = watcher.state();
+  assert.deepEqual([state.routes?.respond, state.routes?.ignore], [1, 1]);
+  assert.match(statusText(state, new Map(), undefined, 0), /1 respond, 0 candidate \(waits for the next notice\), 1 ignored \(merges the agent made itself; not sent\)/);
+  assert.equal(state.repos['o/r'].ownMerges, undefined, 'a merge seen is no longer marked');
+});
+
+test('a PR the watch does not follow cannot be marked as merged by this session', async () => {
+  const { gh, watcher } = setup();
+  gh.set(pr(73));
+  await watcher.watch('o/r', { prs: [73] });
+  assert.equal(await watcher.noteOwnMerge('o/r', 99), false);
+  assert.equal(await watcher.noteOwnMerge('o/absent', 73), false);
+  assert.equal(watcher.state().repos['o/r'].ownMerges, undefined);
+});
+
+test('the cleanup of a merge this session made is still done and reported, quietly', async () => {
+  const { gh, watcher, tick } = setup();
+  gh.set(pr(74, { mergeStateStatus: 'CLEAN' }), pr(75));
+  await watcher.watch('o/r', { prs: [74, 75], clone: '/work/clone' });
+  await watcher.noteOwnMerge('o/r', 74);
+  gh.set(pr(74, { state: 'MERGED', mergeCommit: { oid: 'dddd00112233' } }), pr(75)); tick();
+  const cleaned: string[] = [];
+  const { notices } = await watcher.poll(undefined, undefined, {
+    cleanup: async ({ clone, events }) => events.map(e => { cleaned.push(String(e.pr)); return { pr: e.pr, text: `deleted local branch feat/74 (${clone})` }; }),
+  });
+  assert.deepEqual(cleaned, ['74'], 'the merged PR was cleaned, even though its merge is not announced');
+  assert.deepEqual(notices.map(n => n.wake), [false]);
+  assert.match(notices[0].text, /since last notice: #74 deleted local branch feat\/74 \(\/work\/clone\)/);
+});
+
+test('a subscriber takes the notices of its PR; the others stay with this session', async () => {
+  const { gh, watcher } = setup();
+  gh.set(pr(80, {}, [['test', 'IN_PROGRESS']]), pr(81, {}, [['test', 'IN_PROGRESS']]));
+  await watcher.watch('o/r', { prs: [80], subscriber: 'worker-1' });
+  await watcher.watch('o/r', { prs: [81] });
+  gh.set(pr(80, {}, [['test', 'COMPLETED', 'FAILURE']]), pr(81, {}, [['test', 'COMPLETED', 'FAILURE']]));
+  const { notices } = await watcher.poll();
+  assert.equal(notices.length, 2);
+  const taken = notices.find(n => n.subscriber === 'worker-1');
+  const kept = notices.find(n => n.subscriber === undefined);
+  assert.deepEqual(taken?.events.map(e => e.pr), [80]);
+  assert.deepEqual(kept?.events.map(e => e.pr), [81]);
+  assert.match(statusText(watcher.state(), new Map(), 'o/r', 0), /#80 [^\n]*· for worker-1/);
+  assert.deepEqual(watcher.state().repos['o/r'].subscribers, { 'pr:80': 'worker-1' });
+  await watcher.unwatch('o/r', [80]);
+  assert.equal(watcher.state().repos['o/r'].subscribers, undefined, 'a subscriber ends with its PR');
+});
+
+test('state written before failing-job links existed loads, and its failing PR still shows in status', async () => {
+  const { gh, watcher } = setup();
+  gh.set(jobsPr(90, {}, [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', run: 90, job: 1 }]));
+  await watcher.watch('o/r', { prs: [90] });
+  const file = join(watcher.store.dir, 'state.json');
+  const saved = JSON.parse(readFileSync(file, 'utf8'));
+  for (const s of Object.values(saved.repos['o/r'].snapshots) as { checks: Record<string, unknown> }[]) delete s.checks.failedJobs;
+  writeFileSync(file, JSON.stringify(saved));
+  const text = statusText(new Store(watcher.store.dir).load(), new Map(), 'o/r', 0);
+  assert.match(text, /#90 BLOCKED · checks fail/);
+  assert.doesNotMatch(text, /jobs:/);
+});
+
+test('the GraphQL query asks for each PR head branch, so a notice can name it', () => {
+  assert.match(query([1], true), /headRefOid headRefName author/);
+  assert.match(query([1], false), /headRefName/);
+});
+
+test('a held change of the same PR and kind is superseded by the wake that states it', async () => {
+  const { gh, watcher, tick } = setup();
+  gh.set(pr(13, {}, [['test', 'COMPLETED', 'SUCCESS']]));
+  await watcher.watch('o/r', { prs: [13] });
+  gh.set(pr(13, {}, [['test', 'IN_PROGRESS']])); tick();
+  assert.deepEqual((await watcher.poll()).notices, []);
+  gh.set(pr(13, {}, [['test', 'COMPLETED', 'FAILURE']])); tick();
+  const { notices } = await watcher.poll();
+  assert.deepEqual(notices.map(n => n.wake), [true]);
+  assert.doesNotMatch(notices[0].text, /since last notice/, 'the failure already says what the running check became');
 });

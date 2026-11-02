@@ -44,14 +44,17 @@ export async function cleanMerged(git: GitRunner, clone: string, head: string): 
   return lines;
 }
 
-/** The note appended to a notice whose merged PRs left branches in the clone the agent pushed from; '' when none, or when the agent already removed that clone (git cannot start in a missing directory: spawn ENOENT). */
-export async function cleanupNote(git: GitRunner, notice: { clone?: string; events: { kind: string; pr: number; head?: string }[] }): Promise<string> {
-  if (!notice.clone || !existsSync(notice.clone)) return '';
-  const lines: string[] = [];
+/** One local cleanup result, tied to the PR whose merge caused it. */
+export interface CleanupLine { pr: number; text: string }
+
+/** The cleanup results for each merged event of a clone; a clone the agent already removed has none. Never throws. */
+export async function cleanupLines(git: GitRunner, notice: { clone?: string; events: { kind: string; pr: number; head?: string }[] }): Promise<CleanupLine[]> {
+  if (!notice.clone || !existsSync(notice.clone)) return [];
+  const lines: CleanupLine[] = [];
   for (const e of notice.events) {
     if (e.kind !== 'merged' || !e.head) continue;
-    try { lines.push(...(await cleanMerged(git, notice.clone, e.head)).map(l => `#${e.pr} ${l}`)); }
-    catch (error) { lines.push(`#${e.pr} cleanup skipped: ${String((error as Error).message ?? error).split(/\r?\n/).filter(l => l.trim()).pop()}`); }
+    try { lines.push(...(await cleanMerged(git, notice.clone, e.head)).map(text => ({ pr: e.pr, text }))); }
+    catch (error) { lines.push({ pr: e.pr, text: `cleanup skipped: ${String((error as Error).message ?? error).split(/\r?\n/).filter(l => l.trim()).pop()}` }); }
   }
-  return lines.length ? `\nLocal cleanup in ${notice.clone}: ${lines.join('; ')}.` : '';
+  return lines;
 }

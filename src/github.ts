@@ -20,7 +20,7 @@ export const BRANCH = /^[A-Za-z0-9._\/-]{1,200}$/;
 
 const ROLLUP = `statusCheckRollup { contexts(first: 100) { nodes { __typename
   ... on CheckRun { name status conclusion detailsUrl } ... on StatusContext { context state targetUrl } } } }`;
-const FIELDS = `number title url state isDraft mergeStateStatus reviewDecision headRefOid author { login } autoMergeRequest { enabledAt } mergeCommit { oid }
+const FIELDS = `number title url state isDraft mergeStateStatus reviewDecision headRefOid headRefName author { login } autoMergeRequest { enabledAt } mergeCommit { oid }
   commits(last: 1) { nodes { commit { ${ROLLUP} } } }`;
 const literal = (s: string) => JSON.stringify(s);
 
