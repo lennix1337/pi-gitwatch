@@ -142,6 +142,19 @@ test('a push follows the branch PR when there is one, else the branch CI; an ope
   assert.equal(watcher.state().repos['o/r'].mode, 'open');
 });
 
+test('a push to a branch with no PR costs one GitHub call: the head lookup also reads the branch CI', async () => {
+  const { gh, watcher } = setup();
+  gh.branches.set('feat/new', commit('e5', [['test', 'QUEUED']]));
+  gh.calls.length = 0;
+  assert.equal(await watchPush(watcher, 'o/r', 'feat/new'), 'o/r feat/new CI');
+  assert.equal(gh.calls.length, 1, 'one GraphQL request, not a head lookup followed by a branch read');
+  assert.equal(watcher.state().repos['o/r'].branches!['feat/new'].head, 'e5000000', 'the baseline is the branch head the lookup returned');
+  assert.deepEqual(Object.keys(watcher.state().repos['o/r'].branches!), ['feat/new']);
+  gh.calls.length = 0;
+  await assert.rejects(watchPush(watcher, 'o/r', 'gone'), /Branch gone not found in o\/r/);
+  assert.equal(gh.calls.length, 1, 'a missing branch is also answered by that single request');
+});
+
 test('auto-merge PRs stay quiet when checks pass and wake once if they do not merge', async () => {
   const { gh, watcher, tick } = setup();
   gh.set(pr(6, { autoMergeRequest: {} }, [['test', 'IN_PROGRESS']]));

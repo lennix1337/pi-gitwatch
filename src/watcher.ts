@@ -1,10 +1,10 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { fetchRepo, MAX_BRANCHES, MAX_PRS, openPrFor, type Runner } from './github.ts';
+import { fetchRepo, lookupPush, MAX_BRANCHES, MAX_PRS, type Runner } from './github.ts';
 import {
   autoMergeStall, baselineBranch, branchDiff, branchHint, branchLine, brt, diff, hint, line, normalize, normalizeBranch, settle,
-  type BranchSnapshot, type Snapshot, type WatchEvent,
+  type BranchSnapshot, type RawCommit, type Snapshot, type WatchEvent,
 } from './model.ts';
 
 export interface RepoWatch {
@@ -22,7 +22,11 @@ export interface RepoWatch {
   /** The local clone the agent pushed from: after a merge, its branches still at the PR head are cleaned up. */
   clone?: string;
 }
-export interface WatchRequest { prs?: number[]; branch?: string; intervalSec?: number; awaitMerge?: boolean; clone?: string }
+export interface WatchRequest {
+  prs?: number[]; branch?: string; intervalSec?: number; awaitMerge?: boolean; clone?: string;
+  /** The branch head the caller just read (null: the branch does not exist). Used instead of a request when nothing else is tracked. */
+  head?: RawCommit | null;
+}
 /** Routing decisions, including tool status refreshes; not evidence of host delivery or model execution. */
 export interface Stats { since: number; woke: number; quiet: number }
 export interface DeliveryStats { since: number; wakeAccepted: number; quietAccepted: number; uncertain: number }
@@ -126,7 +130,9 @@ export class Watcher {
       const clone = request.clone ?? state.repos[repo]?.clone;
       if (clone) watch.clone = clone;
       if (intervalSec !== undefined) state.intervalSec = intervalSec;
-      const { snapshots, branches } = await this.fetch(repo, watch, undefined, branch);
+      const { snapshots, branches } = branch && request.head !== undefined && !tracksPulls(watch)
+        ? { snapshots: new Map<number, Snapshot>(), branches: new Map(request.head ? [[branch, normalizeBranch(branch, request.head)]] : []) }
+        : await this.fetch(repo, watch, undefined, branch);
       const missing = watch.prs.filter(n => !snapshots.has(n));
       if (missing.length) throw new Error(`Not found in ${repo}: ${missing.map(n => `#${n}`).join(', ')}.`);
       if (branch && !branches.get(branch)) throw new Error(`Branch ${branch} not found in ${repo}.`);
@@ -316,15 +322,20 @@ function advanceBranches(watch: RepoWatch, branches: Map<string, BranchSnapshot>
  * the pushed commit. Returns what is now followed.
  */
 export async function watchPush(watcher: Watcher, repo: string, branch: string, clone?: string): Promise<string> {
-  const pr = await openPrFor(watcher.run, repo, branch);
+  const { pr, head } = await lookupPush(watcher.run, repo, branch);
   if (!pr) {
-    await watcher.watch(repo, { branch, clone });
+    await watcher.watch(repo, { branch, clone, head });
     return `${repo} ${branch} CI`;
   }
   const existing = watcher.state().repos[repo];
   const covered = existing && (existing.mode === 'open' ? !existing.ignore?.includes(pr) : existing.prs.includes(pr));
   if (!covered || (clone && existing.clone !== clone)) await watcher.watch(repo, { prs: [pr], clone });
   return `${repo} #${pr}`;
+}
+
+/** Whether a watch needs the pull requests read on every fetch: an open watch, a listed PR, or a snapshot still shown. */
+function tracksPulls(watch: RepoWatch): boolean {
+  return watch.mode === 'open' || watch.prs.length > 0 || Object.keys(watch.snapshots).length > 0;
 }
 
 /** A list watch with no PR and no branch left has nothing to follow. */

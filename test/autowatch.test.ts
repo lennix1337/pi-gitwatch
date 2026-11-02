@@ -44,6 +44,18 @@ test('a push resolves to a GitHub repository and branch through git', async () =
   assert.equal(githubRepo('https://github.com/o/r'), 'o/r');
 });
 
+test('the remote URL and the repository root of a push are read together, not one after the other', async () => {
+  // Deterministic: each git call waits until the other has started. Sequential reads would time out.
+  let started = 0;
+  const barrier = async () => {
+    started++;
+    const deadline = Date.now() + 1000;
+    while (started < 2) { if (Date.now() > deadline) throw new Error('git calls ran one after the other'); await new Promise(r => setTimeout(r, 1)); }
+  };
+  const git = async (args: string[]) => { await barrier(); return args[0] === 'remote' ? 'git@github.com:o/r.git' : 'C:/w'; };
+  assert.deepEqual(await resolvePush({ dir: '/w', remote: 'origin', branch: 'main' }, git), { repo: 'o/r', branch: 'main', clone: 'C:/w' });
+});
+
 // Seen live 2026-11-01/02: a bare `git push` from a worktree whose branch tracks a fork (other remote, other branch name)
 // ended in "Branch fix/x not found in lennix1337/Genexus18MCP", because the push was read as going to origin under the local name.
 test('a bare push follows the remote and branch the push really goes to', async () => {

@@ -87,11 +87,14 @@ function gitPush(words: string[], dir: string): Push | undefined {
 export async function resolvePush(push: Push, git: GitRunner): Promise<{ repo: string; branch: string; clone?: string } | undefined> {
   const target = push.implicitRemote && !push.branch ? await upstreamOf(push.dir, git) : undefined;
   const remote = target?.remote ?? push.remote;
-  const url = /^(https?:|git@|ssh:)/.test(remote) ? remote : await git(['remote', 'get-url', remote], push.dir);
+  // The remote URL, the branch and the repository root are independent reads of the same folder: they go out together.
+  const [url, branch, clone] = await Promise.all([
+    /^(https?:|git@|ssh:)/.test(remote) ? remote : git(['remote', 'get-url', remote], push.dir),
+    push.branch ?? target?.branch ?? git(['rev-parse', '--abbrev-ref', 'HEAD'], push.dir),
+    git(['rev-parse', '--show-toplevel'], push.dir).catch(() => ''),
+  ]);
   const repo = githubRepo(url);
-  const branch = push.branch ?? target?.branch ?? await git(['rev-parse', '--abbrev-ref', 'HEAD'], push.dir);
   if (!repo || !branch || branch === 'HEAD' || !BRANCH.test(branch)) return undefined;
-  const clone = await git(['rev-parse', '--show-toplevel'], push.dir).catch(() => '');
   return { repo, branch, ...clone ? { clone } : {} };
 }
 
