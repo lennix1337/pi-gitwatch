@@ -13,7 +13,7 @@ test('git push is found with its directory, remote and branch', () => {
   assert.deepEqual(pushes('cd C:/projetos/dotfiles && git add -A && git commit -q -m "x" && git push -q origin main 2>&1 | tail -1', 'C:/Users/me'),
     [{ dir: 'C:/projetos/dotfiles', remote: 'origin', branch: 'main' }]);
   assert.deepEqual(pushes('git -C ../repo push -u origin HEAD:refs/heads/feat/y', '/work/a'), [{ dir: resolve('/work/a', '../repo'), remote: 'origin', branch: 'feat/y' }]);
-  assert.deepEqual(pushes('git push', '/w'), [{ dir: '/w', remote: 'origin' }], 'no refspec: the current branch is resolved later');
+  assert.deepEqual(pushes('git push', '/w'), [{ dir: '/w', remote: 'origin', implicitRemote: true }], 'no refspec: the current branch is resolved later');
   assert.deepEqual(pushes('git push -o ci.skip origin +fix', '/w'), [{ dir: '/w', remote: 'origin', branch: 'fix' }]);
 });
 
@@ -42,4 +42,15 @@ test('a push resolves to a GitHub repository and branch through git', async () =
   assert.equal(await resolvePush({ dir: '/w', remote: 'origin', branch: 'main' }, other), undefined, 'another host is not followed');
   assert.equal(githubRepo('https://github.com/o/r.git'), 'o/r');
   assert.equal(githubRepo('https://github.com/o/r'), 'o/r');
+});
+
+// Seen live 2026-11-01/02: a bare `git push` from a worktree whose branch tracks a fork (other remote, other branch name)
+// ended in "Branch fix/x not found in lennix1337/Genexus18MCP", because the push was read as going to origin under the local name.
+test('a bare push follows the remote and branch the push really goes to', async () => {
+  const git = async (args: string[]) => args[0] === 'remote' ? (args[2] === 'fork' ? 'https://github.com/davidagostini/Genexus18MCP.git' : 'https://github.com/lennix1337/Genexus18MCP.git')
+    : args.includes('@{push}') ? 'fork/fix/x-remote' : args[1] === '--show-toplevel' ? 'C:/w' : 'fix/x';
+  assert.deepEqual(await resolvePush({ dir: '/w', remote: 'origin', implicitRemote: true }, git), { repo: 'davidagostini/Genexus18MCP', branch: 'fix/x-remote', clone: 'C:/w' });
+  assert.deepEqual(await resolvePush({ dir: '/w', remote: 'origin' }, git), { repo: 'lennix1337/Genexus18MCP', branch: 'fix/x', clone: 'C:/w' }, 'an explicit remote is never replaced');
+  const noUpstream = async (args: string[]) => { if (args.includes('@{push}')) throw new Error('no upstream'); return args[0] === 'remote' ? 'git@github.com:o/r.git' : 'main'; };
+  assert.deepEqual(await resolvePush({ dir: '/w', remote: 'origin', implicitRemote: true }, noUpstream), { repo: 'o/r', branch: 'main', clone: 'main' }, 'without an upstream the current branch on origin is used');
 });
