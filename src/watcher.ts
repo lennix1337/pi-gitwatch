@@ -168,10 +168,12 @@ export class Watcher {
       const state = this.store.load();
       const notices: Notice[] = [];
       const all = new Map<string, WatchEvent[]>();
-      for (const [repo, watch] of Object.entries(state.repos)) {
-        if (only && repo !== only) continue;
+      const watched = Object.entries(state.repos).filter(([repo]) => !only || repo === only);
+      // Each repository is an independent read, so they are fetched together; results are still applied in order below.
+      const fetched = await settleBounded(watched, FETCH_CONCURRENCY, ([repo, watch]) => this.fetch(repo, watch, signal));
+      for (const [index, [repo, watch]] of watched.entries()) {
         try {
-          const { snapshots, open, branches } = await this.fetch(repo, watch, signal);
+          const { snapshots, open, branches } = settledValue(fetched[index]);
           const events = [...advancePrs(watch, snapshots, open, this.now()), ...advanceBranches(watch, branches)];
           if (watch.failures >= FAILURES_BEFORE_NOTICE) events.push({ pr: 0, kind: 'checks', text: `polling recovered after ${watch.failures} failures`, wake: false });
           watch.failures = 0; delete watch.lastError; watch.lastPoll = this.now();
@@ -224,6 +226,33 @@ export class Watcher {
       if (!Object.keys(watch.branches).length) delete watch.branches;
     }
   }
+}
+
+/**
+ * Concurrent GitHub reads per poll. A few repositories are typical, so this only caps a burst for a long watch list
+ * and keeps the `gh` process count and GraphQL rate use bounded.
+ */
+const FETCH_CONCURRENCY = 4;
+
+/** Runs `work` for every item with at most `limit` in flight; each outcome is settled and returned in input order. */
+async function settleBounded<T, R>(items: readonly T[], limit: number, work: (item: T) => Promise<R>): Promise<PromiseSettledResult<R>[]> {
+  const results: PromiseSettledResult<R>[] = [];
+  let next = 0;
+  const lane = async () => {
+    while (next < items.length) {
+      const index = next++;
+      try { results[index] = { status: 'fulfilled', value: await work(items[index]) }; }
+      catch (reason) { results[index] = { status: 'rejected', reason }; }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, lane));
+  return results;
+}
+
+/** The value of a settled read, or its failure rethrown where the caller handles it. */
+function settledValue<R>(outcome: PromiseSettledResult<R>): R {
+  if (outcome.status === 'rejected') throw outcome.reason;
+  return outcome.value;
 }
 
 /** A merged or closed PR is no longer awaited. */

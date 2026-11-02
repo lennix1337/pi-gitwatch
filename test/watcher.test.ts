@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import type { Runner } from '../src/github.ts';
 import { FAILURES_BEFORE_NOTICE, statusText, Store, Watcher, watchPush } from '../src/watcher.ts';
 import { commit, FakeGitHub, pr, tempDir } from './fixtures.ts';
 
@@ -188,4 +189,80 @@ test('the clone a push came from rides on the merge notice with the merged head,
   const { notices } = await watcher.poll();
   assert.equal(notices[0].clone, 'C:/projetos/r');
   assert.deepEqual(notices[0].events.filter(e => e.kind === 'merged').map(e => e.head), ['5aaaaaaa'], 'the short head a snapshot keeps; git resolves it');
+});
+
+/**
+ * A runner that holds each GitHub read until `expected` of them are in flight (or a second passes), then answers like
+ * FakeGitHub. A sequential poll never gets `expected` reads in flight, so its peak stays at one.
+ */
+function barrierRunner(gh: FakeGitHub, expected: number) {
+  let inFlight = 0, peak = 0;
+  const calls: string[][] = [];
+  let release!: () => void;
+  const everyone = new Promise<void>(resolve => { release = resolve; });
+  const run: Runner = async (args, signal) => {
+    calls.push(args);
+    inFlight++;
+    peak = Math.max(peak, inFlight);
+    if (inFlight === expected) release();
+    try {
+      await Promise.race([everyone, new Promise(resolve => setTimeout(resolve, 1000))]);
+      return await gh.run(args, signal);
+    } finally {
+      inFlight--;
+    }
+  };
+  return { run, calls, peak: () => peak };
+}
+
+const repoNames = (count: number) => Array.from({ length: count }, (_, i) => `o/r${i}`);
+
+test('a poll reads every watched repository at once, not one after another', async () => {
+  const gh = new FakeGitHub();
+  gh.set(pr(1));
+  const dir = tempDir();
+  const clock = () => Date.UTC(2026, 9, 30, 16, 50);
+  const setup = new Watcher(new Store(dir), gh.run, clock);
+  for (const repo of repoNames(3)) await setup.watch(repo, { prs: [1] });
+  const barrier = barrierRunner(gh, 3);
+  const { notices } = await new Watcher(new Store(dir), barrier.run, clock).poll();
+  assert.equal(barrier.calls.length, 3, 'each watched repository is read once');
+  assert.equal(barrier.peak(), 3, 'the three reads overlap');
+  assert.equal(notices.length, 0);
+});
+
+test('a poll keeps at most four repository reads in flight, to stay within GitHub rate limits', async () => {
+  const gh = new FakeGitHub();
+  gh.set(pr(1));
+  const dir = tempDir();
+  const clock = () => Date.UTC(2026, 9, 30, 16, 50);
+  const setup = new Watcher(new Store(dir), gh.run, clock);
+  for (const repo of repoNames(6)) await setup.watch(repo, { prs: [1] });
+  const barrier = barrierRunner(gh, 4);
+  await new Watcher(new Store(dir), barrier.run, clock).poll();
+  assert.equal(barrier.calls.length, 6);
+  assert.equal(barrier.peak(), 4);
+});
+
+test('a failing repository is counted on its own while the others in the same poll still report', async () => {
+  const gh = new FakeGitHub();
+  gh.set(pr(1, {}, [['test', 'IN_PROGRESS']]));
+  const dir = tempDir();
+  const clock = () => Date.UTC(2026, 9, 30, 16, 50);
+  const setup = new Watcher(new Store(dir), gh.run, clock);
+  await setup.watch('o/good', { prs: [1] });
+  await setup.watch('o/bad', { prs: [1] });
+  gh.set(pr(1, {}, [['test', 'COMPLETED', 'FAILURE']]));
+  const flaky: Runner = async (args, signal) => {
+    if (args.includes('name=bad')) throw new Error('HTTP 502');
+    return gh.run(args, signal);
+  };
+  const watcher = new Watcher(new Store(dir), flaky, clock);
+  const notices = [];
+  for (let i = 0; i < FAILURES_BEFORE_NOTICE; i++) notices.push(...(await watcher.poll()).notices);
+  assert.deepEqual(notices.map(n => n.repo), ['o/good', 'o/bad']);
+  assert.equal(notices[0].wake, true, 'the good repository woke the agent on its first poll');
+  assert.match(notices[1].text, /o\/bad[\s\S]*Polling failed 3 times in a row: HTTP 502/);
+  assert.equal(watcher.state().repos['o/good'].failures, 0);
+  assert.equal(watcher.state().repos['o/bad'].failures, FAILURES_BEFORE_NOTICE);
 });
