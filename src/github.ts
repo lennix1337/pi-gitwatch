@@ -63,10 +63,15 @@ export async function fetchRepo(run: Runner, repo: string, numbers: number[], op
   return { prs, open: openNumbers, branches: heads };
 }
 
-/** The open PR whose head is `branch` in `repo`, if any (same-repository heads only). */
-export async function openPrFor(run: Runner, repo: string, branch: string, signal?: AbortSignal): Promise<number | undefined> {
+/**
+ * The open PR whose head is `branch` in `repo` (same-repository heads only), and the branch's head commit, in one request:
+ * a push needs both to choose between following its PR and following its CI.
+ */
+export async function lookupPush(run: Runner, repo: string, branch: string, signal?: AbortSignal): Promise<{ pr?: number; head: RawCommit | null }> {
   const repository = await graphql(run, repo, `query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) {
-  head: pullRequests(headRefName: ${literal(branch)}, states: OPEN, first: 10) { nodes { number headRepository { nameWithOwner } } } } }`, signal);
+  head: pullRequests(headRefName: ${literal(branch)}, states: OPEN, first: 10) { nodes { number headRepository { nameWithOwner } } }
+  b0: ref(qualifiedName: ${literal(`refs/heads/${branch}`)}) { target { ... on Commit { oid messageHeadline ${ROLLUP} } } } } }`, signal);
   const nodes = (repository.head as { nodes: { number: number; headRepository: { nameWithOwner: string } | null }[] } | undefined)?.nodes ?? [];
-  return nodes.find(n => n.headRepository?.nameWithOwner.toLowerCase() === repo.toLowerCase())?.number;
+  const target = (repository.b0 as { target?: RawCommit } | null | undefined)?.target;
+  return { pr: nodes.find(n => n.headRepository?.nameWithOwner.toLowerCase() === repo.toLowerCase())?.number, head: target?.oid ? target : null };
 }
