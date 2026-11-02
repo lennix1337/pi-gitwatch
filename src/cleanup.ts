@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import type { GitRunner } from './autowatch.ts';
 
 /** Long-lived branches are never cleaned, even when one happens to point at a merged PR head. */
@@ -43,9 +44,9 @@ export async function cleanMerged(git: GitRunner, clone: string, head: string): 
   return lines;
 }
 
-/** The note appended to a notice whose merged PRs left branches in the clone the agent pushed from; '' when none. */
+/** The note appended to a notice whose merged PRs left branches in the clone the agent pushed from; '' when none, or when the agent already removed that clone (git cannot start in a missing directory: spawn ENOENT). */
 export async function cleanupNote(git: GitRunner, notice: { clone?: string; events: { kind: string; pr: number; head?: string }[] }): Promise<string> {
-  if (!notice.clone) return '';
+  if (!notice.clone || !existsSync(notice.clone)) return '';
   const lines: string[] = [];
   for (const e of notice.events) {
     if (e.kind !== 'merged' || !e.head) continue;

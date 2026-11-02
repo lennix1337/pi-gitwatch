@@ -56,3 +56,9 @@ test('the note names the PR and is empty without a clone or merged event', async
   const note = await cleanupNote(gitRunner, { clone: dir, events: [{ kind: 'merged', pr: 3, head: head.slice(0, 8) }] });
   assert.match(note, /^\nLocal cleanup in .*: #3 removed branch done; #3 kept wt-dirty: .*untracked files.*; #3 removed worktree .* and branch wt-done\.$/);
 });
+
+test('a clone the agent already removed leaves no "spawn git ENOENT" note', async () => {
+  const { dir, head } = repo();
+  const gone = join(dir, 'worktrees', 'already-removed');
+  assert.equal(await cleanupNote(gitRunner, { clone: gone, events: [{ kind: 'merged', pr: 4, head }] }), '');
+});
