@@ -19,8 +19,6 @@ export interface RepoWatch {
   /** Branches whose latest commit's CI is followed until it finishes (CI of a direct push). */
   branches?: Record<string, BranchSnapshot>;
   lastPoll?: number; lastError?: string; failures: number;
-  /** PRs whose merge the agent waits on: their merge wakes it even with auto-merge on. */
-  awaited?: number[];
   /** The local clone the agent pushed from: after a merge, its branches still at the PR head are cleaned up. */
   clone?: string;
   /** PRs this session merged itself (`gh pr merge` without --auto): their merge is already known to the agent. */
@@ -33,7 +31,7 @@ export interface RepoWatch {
 /** Candidate events held for one target: when the oldest was held, and how many older ones the cap dropped. */
 export interface Held { since: number; items: WatchEvent[]; omitted?: number }
 export interface WatchRequest {
-  prs?: number[]; branch?: string; intervalSec?: number; awaitMerge?: boolean; clone?: string;
+  prs?: number[]; branch?: string; intervalSec?: number; clone?: string;
   /** A subscriber label that takes the notices of these PRs or this branch. */
   subscriber?: string;
   /** The branch head the caller just read (null: the branch does not exist). Used instead of a request when nothing else is tracked. */
@@ -385,7 +383,6 @@ export class Watcher {
     for (const [n, s] of Object.entries(watch.snapshots)) if (s.state !== 'OPEN') delete watch.snapshots[n];
     // Named PRs that are no longer open leave the list in both modes; an open watch kept them and re-read them forever.
     watch.prs = watch.prs.filter(n => watch.snapshots[n]);
-    pruneAwaited(watch);
     if (branches && watch.branches) {
       for (const [name, s] of Object.entries(watch.branches)) if (s.reported) delete watch.branches[name];
       if (!Object.keys(watch.branches).length) delete watch.branches;
@@ -421,12 +418,6 @@ function settledValue<R>(outcome: PromiseSettledResult<R>): R {
   return outcome.value;
 }
 
-/** A merged or closed PR is no longer awaited. */
-function pruneAwaited(watch: RepoWatch) {
-  if (!watch.awaited) return;
-  watch.awaited = watch.awaited.filter(n => watch.snapshots[n]);
-  if (!watch.awaited.length) delete watch.awaited;
-}
 
 /** A subscriber stays only while its PR or branch is followed. */
 function pruneSubscribers(watch: RepoWatch) {
@@ -449,7 +440,7 @@ function setSubscribers(watch: RepoWatch, prs: number[], branch: string | undefi
 const keepAnnounced = (next: Snapshot, prev: Snapshot | undefined): Snapshot => (prev?.announced ? { ...next, announced: prev.announced } : next);
 
 /** The watch a request leads to, before GitHub confirms its PRs and branch exist. */
-function nextWatch(existing: RepoWatch | undefined, { prs, branch, awaitMerge }: WatchRequest): RepoWatch {
+function nextWatch(existing: RepoWatch | undefined, { prs, branch }: WatchRequest): RepoWatch {
   const mode = prs?.length || branch ? 'list' : 'open';
   const merged = mode === 'list' && existing?.mode === 'list' ? [...new Set([...existing.prs, ...prs ?? []])] : prs ?? [];
   if (merged.length > MAX_PRS) throw new Error(`At most ${MAX_PRS} PRs per repository.`);
@@ -460,8 +451,6 @@ function nextWatch(existing: RepoWatch | undefined, { prs, branch, awaitMerge }:
     ...existing?.ownMerges ? { ownMerges: existing.ownMerges } : {},
     ...existing?.held ? { held: existing.held } : {},
   };
-  const awaited = [...new Set([...existing?.awaited ?? [], ...awaitMerge ? prs ?? [] : []])];
-  if (awaited.length) watch.awaited = awaited;
   const ignore = existing?.ignore?.filter(n => !prs?.includes(n));
   // Watching the whole repository again forgets the PRs unwatched from it; adding PRs or a branch keeps that list.
   if (watch.mode === 'open' && ignore?.length && (prs?.length || branch)) watch.ignore = ignore;
@@ -487,7 +476,7 @@ function advancePrs(watch: RepoWatch, snapshots: Map<number, Snapshot>, open: nu
     let next = snapshot;
     if (prev || watch.mode === 'open') {
       let announced: Announced | undefined = prev?.announced;
-      const events = [...diff(prev, next, watch.awaited?.includes(n)), ...stall ? [stall] : []];
+      const events = [...diff(prev, next), ...stall ? [stall] : []];
       for (const event of events) {
         const decision = routeEvent(event, { ownMerge: watch.ownMerges?.includes(n) ?? false, cur: next, announced });
         out.push({ event, decision });
@@ -569,7 +558,7 @@ export function statusText(state: State, events: Map<string, WatchEvent[]>, only
     ? `${only} is not watched. Start: gitwatch {"action":"watch","repo":"${only}"} (all open PRs) or add "prs":[123].`
     : 'No repositories watched. Start: gitwatch {"action":"watch","repo":"owner/name"} (all open PRs) or add "prs":[123].') + stats;
   return repos.map(([repo, w]) => repoStatus(repo, w, events.get(repo) ?? [])).join('\n\n')
-    + `\nEvery ${state.intervalSec}s the watcher requests a turn on failed or finished checks, conflicts, unexpected merges and closes, and when a watched branch's CI finishes; a merge you queued with auto-merge is sent for your next turn instead, unless you watched it with "awaitMerge":true.${stats}`;
+    + `\nEvery ${state.intervalSec}s the watcher requests a turn on failed or finished checks, conflicts, merges (auto-merge included) and closes, and when a watched branch's CI finishes.${stats}`;
 }
 
 /** Lifetime counters across all repositories; no historical routing count is upgraded to delivery evidence. */
