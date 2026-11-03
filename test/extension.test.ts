@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import extension, { Lease, MESSAGE_TYPE } from '../src/index.ts';
 import { SUBSCRIBER_NOTICE_CHANNEL, type SubscriberNotice } from '../src/subscribers.ts';
 import { Store } from '../src/watcher.ts';
+import { pendingFollows, requestFollow } from '../src/follow-requests.ts';
 import { commit, FakeGitHub, pr, tempDir } from './fixtures.ts';
 
 type Handler = (event: unknown, ctx: { mode: string; cwd?: string; hasUI?: boolean; ui?: { notify: (text: string) => void } }) => unknown;
@@ -202,6 +203,28 @@ test('a successful push or gh pr create in bash starts a watch and says so in th
   assert.match((await bash('gh pr create --fill', 'https://github.com/o/r/pull/5\n'))!.content.at(-1)!.text, /could not start following o\/r #5: HTTP 502/);
   const child = harness('json');
   assert.equal(await child.handlers.get('tool_result')!({ toolName: 'bash', input: { command: 'git push' }, content: [], isError: false }, { mode: 'json' }), undefined, 'a non-polling session never watches');
+});
+
+test('a PR another process asks to follow (ship.mjs, a background shell) is followed and its merge wakes the agent', async () => {
+  const h = harness();
+  h.gh.set(pr(32, { autoMergeRequest: {} }, [['test', 'IN_PROGRESS']]));
+  requestFollow(h.dir, { repo: 'o/r', pr: 32 });
+  await h.fire();
+  assert.equal(h.sent.length, 0, 'following is a baseline: nothing to announce yet');
+  assert.deepEqual(pendingFollows(h.dir), [], 'the request is consumed');
+  h.gh.set(pr(32, { state: 'MERGED', autoMergeRequest: {}, mergeCommit: { oid: 'cf5d0032aaaa' } }));
+  await h.fire();
+  assert.equal(h.sent.length, 1);
+  assert.match(h.sent[0].message.content, /#32 merged cf5d0032/);
+  assert.deepEqual(h.sent[0].options, { triggerTurn: true, deliverAs: 'steer' });
+});
+
+test('a malformed follow request is dropped without blocking the poll', async () => {
+  const h = harness();
+  requestFollow(h.dir, { repo: 'not a repo', pr: 1 });
+  await h.fire();
+  assert.deepEqual(pendingFollows(h.dir), []);
+  assert.equal(h.sent.length, 0);
 });
 
 test('a merge queued with auto-merge wakes the agent on its own, without waiting for an operator message', async () => {

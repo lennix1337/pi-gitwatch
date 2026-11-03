@@ -4,6 +4,7 @@ import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import { createdPrs, githubRepo, gitRunner, ownMerges, pushes, resolvePush, type GitRunner } from './autowatch.ts';
 import { cleanupLines } from './cleanup.ts';
+import { pendingFollows } from './follow-requests.ts';
 import { BRANCH, ghRunner, MAX_PRS, REPO, type Runner } from './github.ts';
 import { statusText, Store, Watcher, watchPush, type Notice } from './watcher.ts';
 import { SUBSCRIBER, SUBSCRIBER_NOTICE_CHANNEL, type SubscriberNotice } from './subscribers.ts';
@@ -132,7 +133,17 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
     const state = watcher.state();
     const interval = state.intervalSec * 1000;
     try {
-      if (Object.keys(state.repos).length && lease.acquire(now(), interval * 3)) {
+      const follows = pendingFollows(store.dir);
+      if ((Object.keys(state.repos).length || follows.length) && lease.acquire(now(), interval * 3)) {
+        for (const { request, done } of follows) {
+          try { await watcher.watch(request.repo, { prs: [request.pr] }); done(); }
+          catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            // A PR that is gone or already ended has nothing to follow; anything else (network) is retried next poll.
+            if (/^Not found|already merged or closed/.test(message)) done();
+            warn?.(`Gitwatch: could not follow ${request.repo} #${request.pr} asked by another process (${message.split('\n')[0]}).`);
+          }
+        }
         const { notices } = await watcher.poll(undefined, undefined, { cleanup });
         for (const n of notices) { if (mine !== epoch) break; await deliver(n); }
       }
