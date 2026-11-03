@@ -383,6 +383,14 @@ export class Watcher {
     for (const [n, s] of Object.entries(watch.snapshots)) if (s.state !== 'OPEN') delete watch.snapshots[n];
     // Named PRs that are no longer open leave the list in both modes; an open watch kept them and re-read them forever.
     watch.prs = watch.prs.filter(n => watch.snapshots[n]);
+    // A held change of a PR that is gone is stale: a status refresh showed the merge and dropped the PR, and 30 minutes
+    // later its "checks passed, mergeable" went out on its own after the merge (03/11, pi-optchat #98).
+    for (const [key, h] of Object.entries(watch.held ?? {})) {
+      const items = h.items.filter(i => i.branch !== undefined || i.pr <= 0 || watch.snapshots[i.pr]);
+      if (items.length) watch.held![key] = { ...h, items };
+      else delete watch.held![key];
+    }
+    if (watch.held && !Object.keys(watch.held).length) delete watch.held;
     if (branches && watch.branches) {
       for (const [name, s] of Object.entries(watch.branches)) if (s.reported) delete watch.branches[name];
       if (!Object.keys(watch.branches).length) delete watch.branches;

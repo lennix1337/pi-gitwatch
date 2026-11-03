@@ -369,6 +369,22 @@ test('a held change older than 30 minutes goes out as a quiet notice, once', asy
   assert.deepEqual((await watcher.poll()).notices, []);
 });
 
+test('a status refresh that sees the merge drops what the PR held: no stale "checks passed" 30 minutes later', async () => {
+  const { gh, watcher, tick } = setup();
+  gh.set(pr(7, { autoMergeRequest: {} }, [['test', 'IN_PROGRESS']]), pr(8, {}, [['test', 'COMPLETED', 'SUCCESS']]));
+  await watcher.watch('o/r', { prs: [7] });
+  await watcher.watch('o/r', { prs: [8] });
+  gh.set(pr(7, { autoMergeRequest: {}, mergeStateStatus: 'CLEAN' }, [['test', 'COMPLETED', 'SUCCESS']]), pr(8, {}, [['test', 'IN_PROGRESS']])); tick();
+  assert.deepEqual((await watcher.poll()).notices, [], 'auto-merge PR passing stays quiet');
+  assert.match(JSON.stringify(watcher.state().repos['o/r'].held), /#?7|"pr":7/);
+  gh.set(pr(7, { state: 'MERGED', autoMergeRequest: {}, mergeCommit: { oid: 'cafe00112233' } }), pr(8, {}, [['test', 'IN_PROGRESS']])); tick();
+  await watcher.poll(undefined, undefined, { deliver: false });
+  for (let i = 0; i < 61; i++) tick();
+  const { notices } = await watcher.poll();
+  assert.ok(!notices.some(n => /#7/.test(n.text)), `no stale notice for merged #7: ${notices.map(n => n.text).join('|')}`);
+  assert.match(notices.map(n => n.text).join('\n'), /#8 checks running/, 'an open PR\'s held change still ages out');
+});
+
 test('held changes are bounded: the oldest beyond 40 are counted, not kept, and the wake says so', async () => {
   const { gh, watcher, tick } = setup();
   const check = (n: number, status: string, conclusion: string | null) => pr(n, {}, [['test', status, conclusion]]);
