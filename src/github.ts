@@ -4,8 +4,14 @@ import type { RawCommit, RawPullRequest } from './model.ts';
 /** Runs `gh` with arguments and resolves its stdout. Injected in tests. */
 export type Runner = (args: string[], signal?: AbortSignal) => Promise<string>;
 
+/**
+ * gh forks a detached `gh send-telemetry` child after each call; on Windows that child gets a
+ * console of its own, which Windows Terminal shows as a window flashing open every poll.
+ */
+export const ghEnv = (base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv => ({ ...base, GH_TELEMETRY: '0' });
+
 export const ghRunner: Runner = (args, signal) => new Promise((resolve, reject) => {
-  execFile('gh', args, { timeout: 30_000, maxBuffer: 16 << 20, windowsHide: true, signal }, (error, stdout, stderr) => {
+  execFile('gh', args, { timeout: 30_000, maxBuffer: 16 << 20, windowsHide: true, env: ghEnv(), signal }, (error, stdout, stderr) => {
     if (!error) return resolve(stdout);
     const detail = (stderr || error.message).trim().split(/\r?\n/).filter(Boolean).slice(-2).join(' ');
     reject(new Error(detail.slice(0, 300) || 'gh failed'));
