@@ -209,15 +209,15 @@ test('routing counts notices rather than events or model turns', async () => {
   assert.deepEqual([state.stats?.woke, state.stats?.quiet], [2, 0]);
 });
 
-test('an expected merge alone is routed quietly, without claiming delivery evidence', async () => {
+test('an auto-merge finishing alone wakes, without claiming delivery evidence', async () => {
   const { gh, watcher } = setup();
   gh.set(pr(5, { autoMergeRequest: {} }, [['test', 'IN_PROGRESS']]));
   await watcher.watch('o/r', { prs: [5] });
   gh.set(pr(5, { state: 'MERGED', autoMergeRequest: {}, mergeCommit: { oid: 'eeeeee123456' } }));
   const { notices } = await watcher.poll();
-  assert.deepEqual(notices.map(n => [n.wake, /#5 merged eeeeee12/.test(n.text)]), [[false, true]]);
-  assert.deepEqual([watcher.state().stats?.woke, watcher.state().stats?.quiet], [0, 1]);
-  assert.match(statusText({ ...watcher.state(), repos: { 'o/r': { mode: 'open', prs: [], snapshots: {}, failures: 0 } } }, new Map(), undefined, 0), /0 wake, 1 next-turn; not delivery evidence/);
+  assert.deepEqual(notices.map(n => [n.wake, /#5 merged eeeeee12/.test(n.text)]), [[true, true]]);
+  assert.deepEqual([watcher.state().stats?.woke, watcher.state().stats?.quiet], [1, 0]);
+  assert.match(statusText({ ...watcher.state(), repos: { 'o/r': { mode: 'open', prs: [], snapshots: {}, failures: 0 } } }, new Map(), undefined, 0), /1 wake, 0 next-turn; not delivery evidence/);
 });
 
 test('the clone a push came from rides on the merge notice with the merged head, even into an existing open watch', async () => {
@@ -383,7 +383,7 @@ test('held changes are bounded: the oldest beyond 40 are counted, not kept, and 
   assert.match(notices[0].text, /since last notice: .*\+32 more \(gitwatch \{"action":"status","repo":"o\/r"\}\); 5 earlier omitted/);
 });
 
-test('an expected merge sends what waited for the next turn, quietly', async () => {
+test('an auto-merge finishing wakes and carries what waited for the next turn', async () => {
   const { gh, watcher, tick } = setup();
   gh.set(pr(5, {}, [['test', 'COMPLETED', 'SUCCESS']]), pr(6, { autoMergeRequest: {} }, [['test', 'IN_PROGRESS']]));
   await watcher.watch('o/r', { prs: [5] });
@@ -392,7 +392,7 @@ test('an expected merge sends what waited for the next turn, quietly', async () 
   assert.deepEqual((await watcher.poll()).notices, []);
   gh.set(pr(5, {}, [['test', 'IN_PROGRESS']]), pr(6, { state: 'MERGED', autoMergeRequest: {}, mergeCommit: { oid: 'cafe00112233' } })); tick();
   const { notices } = await watcher.poll();
-  assert.deepEqual(notices.map(n => n.wake), [false]);
+  assert.deepEqual(notices.map(n => n.wake), [true]);
   assert.match(notices[0].text, /#6 merged cafe0011/);
   assert.match(notices[0].text, /since last notice: #5 checks running \(1 pending\)/);
 });

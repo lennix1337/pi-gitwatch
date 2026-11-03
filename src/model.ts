@@ -120,15 +120,15 @@ const MERGE_STATE_TEXT: Record<string, string> = {
 
 /**
  * The transitions from `prev` to `cur`. `wake` marks those the agent must act on; the rest ride along in the same notice.
- * A merge the agent arranged (auto-merge was on) is the expected outcome: it is recorded without a turn, unless the agent
- * said it is `awaited` (work waits on it).
+ * A merge always wakes, auto-merge or not: the next step (pull, release, reload, cleanup) waits on it, and a quiet
+ * note would only surface when the operator next writes.
  */
-export function diff(prev: Snapshot | undefined, cur: Snapshot, awaited = false): WatchEvent[] {
+export function diff(prev: Snapshot | undefined, cur: Snapshot): WatchEvent[] {
   const pr = cur.number;
   // A PR first seen already merged or closed has nothing to announce: it was not opened under this watch.
   if (!prev) return cur.state === 'OPEN' ? [{ pr, kind: 'opened', text: `opened by ${cur.author}`, wake: false }] : [];
   if (cur.state !== prev.state) {
-    if (cur.state === 'MERGED') return [{ pr, kind: 'merged', text: `merged${cur.mergeCommit ? ` ${cur.mergeCommit}` : ''}`, wake: awaited || !prev.auto, head: cur.head }];
+    if (cur.state === 'MERGED') return [{ pr, kind: 'merged', text: `merged${cur.mergeCommit ? ` ${cur.mergeCommit}` : ''}`, wake: true, head: cur.head }];
     if (cur.state === 'CLOSED') return [{ pr, kind: 'closed', text: 'closed without merge', wake: true }];
     return [{ pr, kind: 'reopened', text: 'reopened', wake: true }];
   }
