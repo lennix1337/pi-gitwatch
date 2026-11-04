@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { AUTO_MERGE_STALL_MS, autoMergeStall, branchDiff, branchHint, branchLine, diff, hint, jobsText, line, normalize, normalizeBranch, settle, summarizeChecks, type WatchEvent } from '../src/model.ts';
 import { announce, routeEvent } from '../src/route.ts';
+import type { RawPullRequest } from '../src/model.ts';
 import { commit, pr } from './fixtures.ts';
 
 const ctx = (name: string, status: string, conclusion: string | null = null) => ({ __typename: 'CheckRun', name, status, conclusion });
@@ -70,6 +71,30 @@ test('failing checks name their Actions run and the hint gives the log command',
   const s = normalize(pr(8, {}, [['unit', 'COMPLETED', 'FAILURE']]));
   s.checks.runs = [41];
   assert.equal(hint(s, 'o/r'), 'read the failing job log: gh run view 41 --repo o/r --log-failed');
+});
+
+test('a stall where a required check never reported on the head names it and the rerun, from protection or rulesets', () => {
+  const run = (id: number) => `https://github.com/o/r/actions/runs/${id}/job/1`;
+  const ran = (...ids: number[]) => ({ nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: ids.map((id, i) => ({ __typename: 'CheckRun', name: `job${i}`, status: 'COMPLETED', conclusion: 'SUCCESS', detailsUrl: run(id) })) } } } }] });
+  const base = (protection: string[] | null, ruleset: string[] = []): RawPullRequest['baseRef'] => ({
+    branchProtectionRule: protection ? { requiredStatusCheckContexts: protection } : null,
+    rules: { nodes: [{ type: 'COPILOT_CODE_REVIEW', parameters: {} }, ...ruleset.length ? [{ type: 'REQUIRED_STATUS_CHECKS', parameters: { requiredStatusChecks: ruleset.map(context => ({ context })) } }] : []] },
+  });
+  const raw = (baseRef: RawPullRequest['baseRef'], ...ids: number[]) => pr(117, { autoMergeRequest: {}, baseRef, headRefName: 'feat/x', commits: ran(...(ids.length ? ids : [41819559619])) });
+  const t0 = 1_000_000;
+  const cur = normalize(raw(base(['ci-ok', 'job0'])));
+  const stalled = autoMergeStall(autoMergeStall(undefined, cur, t0).snapshot, cur, t0 + AUTO_MERGE_STALL_MS);
+  assert.equal(stalled.event?.text, 'auto-merge has not merged 10 min after checks passed (BLOCKED): required check ci-ok never reported on this head');
+  assert.equal(hint(stalled.snapshot, 'o/r'), 'required check ci-ok never reported on this head; rerun its workflow: gh run rerun 41819559619 --repo o/r');
+  assert.deepEqual(normalize(raw(base(null, ['lint', 'ci-ok']))).missingRequired, ['ci-ok', 'lint'], 'rulesets count too');
+  const two = normalize(raw(base(['ci-ok']), 1, 2));
+  const twoStalled = autoMergeStall(autoMergeStall(undefined, two, t0).snapshot, two, t0 + AUTO_MERGE_STALL_MS);
+  assert.equal(hint(twoStalled.snapshot, 'o/r'), 'required check ci-ok never reported on this head; rerun its workflow: gh run list --repo o/r --branch feat/x');
+  assert.equal(normalize(raw(base(['job0']))).missingRequired, undefined, 'every required check reported');
+  assert.equal(normalize(raw(base(null))).missingRequired, undefined, 'no protection visible, as on a repository the viewer does not administer');
+  assert.equal(normalize(raw(null)).missingRequired, undefined, 'base branch gone');
+  const full = Array.from({ length: 100 }, (_, i) => i + 1);
+  assert.equal(normalize(raw(base(['ci-ok']), ...full)).missingRequired, undefined, 'a full page of contexts may hide the required one');
 });
 
 test('auto-merge that does not merge 10 min after checks passed wakes once, and a new head starts over', () => {

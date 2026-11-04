@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import type { RawCommit, RawPullRequest } from './model.ts';
+import { CONTEXTS_PAGE, type RawCommit, type RawPullRequest } from './model.ts';
 
 /** Runs `gh` with arguments and resolves its stdout. Injected in tests. */
 export type Runner = (args: string[], signal?: AbortSignal) => Promise<string>;
@@ -24,10 +24,12 @@ export const REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 /** Branch names the watcher accepts; they are embedded in the GraphQL query as JSON string literals. */
 export const BRANCH = /^[A-Za-z0-9._\/-]{1,200}$/;
 
-const ROLLUP = `statusCheckRollup { contexts(first: 100) { nodes { __typename
+const ROLLUP = `statusCheckRollup { contexts(first: ${CONTEXTS_PAGE}) { nodes { __typename
   ... on CheckRun { name status conclusion detailsUrl } ... on StatusContext { context state targetUrl } } } }`;
 const FIELDS = `number title url state isDraft mergeStateStatus reviewDecision headRefOid headRefName author { login } autoMergeRequest { enabledAt } mergeCommit { oid }
-  commits(last: 1) { nodes { commit { ${ROLLUP} } } }`;
+  commits(last: 1) { nodes { commit { ${ROLLUP} } } }
+  baseRef { branchProtectionRule { requiredStatusCheckContexts }
+    rules(first: 20) { nodes { type parameters { ... on RequiredStatusChecksParameters { requiredStatusChecks { context } } } } } }`;
 const literal = (s: string) => JSON.stringify(s);
 
 export function query(numbers: number[], open: boolean, branches: string[] = []): string {
