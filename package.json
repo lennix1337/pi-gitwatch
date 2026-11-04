@@ -23,6 +23,7 @@
   },
   "scripts": {
     "check": "tsc --noEmit",
+    "verify": "npm run check && npm test",
     "test": "node --import tsx --test test/*.test.ts"
   },
   "dependencies": {
