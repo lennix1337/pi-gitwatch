@@ -25,6 +25,13 @@ export interface Snapshot {
   announced?: Announced;
   /** When checks were first seen passing on this head with auto-merge on, and whether the stall was reported. */
   passedAt?: number; stallReported?: boolean;
+  /**
+   * Checks the base branch requires that have no run on the head at all, as when GitHub never created a workflow's
+   * final job: auto-merge then waits forever with every listed check green. Absent when all reported or none is known.
+   */
+  missingRequired?: string[];
+  /** The Actions runs of the head's checks, set with `missingRequired` so the notice can name the rerun. */
+  headRuns?: number[];
 }
 /** The latest commit of a watched branch: its CI is reported once when it finishes, then the branch watch ends. */
 export interface BranchSnapshot { branch: string; head: string; headline: string; checks: Checks; reported: boolean }
@@ -42,6 +49,11 @@ export interface RawPullRequest {
   number: number; title: string; url: string; state: string; isDraft: boolean; mergeStateStatus: string; reviewDecision: string | null;
   headRefOid: string; headRefName?: string; author: { login: string } | null; autoMergeRequest: unknown; mergeCommit: { oid: string } | null;
   commits?: { nodes: { commit: { statusCheckRollup: { contexts: { nodes: RawContext[] } } | null } }[] };
+  /** Required checks of the base: branch protection (null unless the viewer administers the repository) and rulesets. */
+  baseRef?: {
+    branchProtectionRule: { requiredStatusCheckContexts: string[] | null } | null;
+    rules?: { nodes: { type: string; parameters: { requiredStatusChecks?: { context: string }[] } | null }[] } | null;
+  } | null;
 }
 
 const PASS = new Set(['SUCCESS', 'NEUTRAL']);
@@ -97,16 +109,35 @@ export function summarizeChecks(contexts: RawContext[]): Checks {
   return checks;
 }
 
+/** The query reads this many check contexts per head; a full page may hide a required check that did report. */
+export const CONTEXTS_PAGE = 100;
+
+/** Required checks of the base with no context on the head, and the head's Actions runs to rerun. */
+function missingRequired(raw: RawPullRequest, contexts: RawContext[]): Pick<Snapshot, 'missingRequired' | 'headRuns'> {
+  if (contexts.length >= CONTEXTS_PAGE) return {};
+  const required = new Set(raw.baseRef?.branchProtectionRule?.requiredStatusCheckContexts ?? []);
+  for (const rule of raw.baseRef?.rules?.nodes ?? []) for (const check of rule.parameters?.requiredStatusChecks ?? []) required.add(check.context);
+  const reported = new Set(contexts.map(c => c.name ?? c.context ?? '?'));
+  const missing = [...required].filter(name => !reported.has(name)).sort();
+  if (!missing.length) return {};
+  const runs = [...new Set(contexts.map(runId).filter((id): id is number => id !== undefined))].sort((a, b) => a - b);
+  return { missingRequired: missing, headRuns: runs };
+}
+
 export function normalize(raw: RawPullRequest): Snapshot {
   const rollup = raw.commits?.nodes[0]?.commit.statusCheckRollup;
+  const contexts = rollup?.contexts.nodes ?? [];
   const state = raw.state === 'MERGED' || raw.state === 'CLOSED' ? raw.state : 'OPEN';
   return {
     number: raw.number, title: raw.title, url: raw.url, author: raw.author?.login ?? 'ghost', state, draft: raw.isDraft,
     mergeState: raw.mergeStateStatus, review: raw.reviewDecision, head: raw.headRefOid.slice(0, 8), auto: raw.autoMergeRequest != null,
     ...raw.headRefName ? { branch: raw.headRefName } : {},
-    mergeCommit: raw.mergeCommit?.oid.slice(0, 8) ?? null, checks: summarizeChecks(rollup?.contexts.nodes ?? []),
+    mergeCommit: raw.mergeCommit?.oid.slice(0, 8) ?? null, checks: summarizeChecks(contexts),
+    ...missingRequired(raw, contexts),
   };
 }
+
+const missingText = (names: string[]) => `required check${names.length > 1 ? 's' : ''} ${names.join(', ')} never reported on this head`;
 
 /** GitHub reports UNKNOWN while it recomputes mergeability; keep the last known value instead of reporting a flap. */
 export function settle(prev: Snapshot | undefined, cur: Snapshot): Snapshot {
@@ -168,7 +199,8 @@ export function autoMergeStall(prev: Snapshot | undefined, cur: Snapshot, now: n
   if (snapshot.stallReported || now - passedAt < stallMs) return { snapshot };
   snapshot.stallReported = true;
   const minutes = Math.round((now - passedAt) / 60_000);
-  return { snapshot, event: { pr: cur.number, kind: 'stall', text: `auto-merge has not merged ${minutes} min after checks passed (${cur.mergeState})`, wake: true } };
+  const missing = cur.missingRequired?.length ? `: ${missingText(cur.missingRequired)}` : '';
+  return { snapshot, event: { pr: cur.number, kind: 'stall', text: `auto-merge has not merged ${minutes} min after checks passed (${cur.mergeState})${missing}`, wake: true } };
 }
 
 const isFinal = (c: Checks) => c.pending === 0 && (c.state === 'pass' || c.state === 'fail');
@@ -247,6 +279,11 @@ export function hint(s: Snapshot, repo: string): string | undefined {
   if (s.checks.state === 'fail') return failingLog(s.checks, repo, s.number);
   if (s.mergeState === 'BEHIND') return 'update the branch with the base';
   if (s.mergeState === 'CLEAN' && !s.auto && !s.draft) return 'ready to merge';
+  if (s.stallReported && s.missingRequired?.length) {
+    const runs = s.headRuns ?? [];
+    const rerun = runs.length === 1 ? `gh run rerun ${runs[0]} --repo ${repo}` : s.branch ? `gh run list --repo ${repo} --branch ${s.branch}` : `gh pr checks ${s.number} --repo ${repo}`;
+    return `${missingText(s.missingRequired)}; rerun its workflow: ${rerun}`;
+  }
   if (s.stallReported) return `auto-merge is waiting on a review or rule: gh pr view ${s.number} --repo ${repo} --json mergeStateStatus,reviewDecision`;
   return undefined;
 }

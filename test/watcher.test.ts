@@ -487,6 +487,11 @@ test('the GraphQL query asks for each PR head branch, so a notice can name it', 
   assert.match(query([1], false), /headRefName/);
 });
 
+test('the GraphQL query asks for the required checks of each PR base, from branch protection and rulesets', () => {
+  assert.match(query([1], false), /baseRef \{ branchProtectionRule \{ requiredStatusCheckContexts \}/);
+  assert.match(query([1], false), /RequiredStatusChecksParameters \{ requiredStatusChecks \{ context \}/);
+});
+
 test('a held change of the same PR and kind is superseded by the wake that states it', async () => {
   const { gh, watcher, tick } = setup();
   gh.set(pr(13, {}, [['test', 'COMPLETED', 'SUCCESS']]));
