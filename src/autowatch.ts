@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { homedir } from 'node:os';
 import { isAbsolute, resolve } from 'node:path';
 import { BRANCH, REPO } from './github.ts';
 
@@ -35,6 +36,25 @@ function tokens(segment: string): string[] {
   return [...segment.matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)].map(m => m[1] ?? m[2] ?? m[3]);
 }
 
+/** The commands of a shell line: split at `&&`, `||`, `;`, `|` and newlines, but never inside quotes (a regex or a message may hold them). */
+export function segments(command: string): string[] {
+  const out: string[] = [];
+  let quote = '', start = 0;
+  for (let i = 0; i < command.length; i++) {
+    const c = command[i];
+    if (quote) { if (c === '\\' && quote === '"') i++; else if (c === quote) quote = ''; continue; }
+    if (c === '"' || c === "'") { quote = c; continue; }
+    const two = command.slice(i, i + 2);
+    const width = two === '&&' || two === '||' ? 2 : c === ';' || c === '|' || c === '\n' ? 1 : 0;
+    if (!width) continue;
+    out.push(command.slice(start, i));
+    start = i + width;
+    i = start - 1;
+  }
+  out.push(command.slice(start));
+  return out;
+}
+
 /** Options that make a push carry no branch commit worth following. */
 const NOT_A_BRANCH_PUSH = new Set(['--tags', '--delete', '-d', '--mirror', '--all', '--dry-run', '-n', '--prune']);
 /** Options whose value is the next word, so it is not taken for the remote or refspec. */
@@ -47,7 +67,7 @@ const WITH_VALUE = new Set(['-o', '--push-option', '--repo', '--receive-pack', '
 export function pushes(command: string, cwd: string): Push[] {
   const found: Push[] = [];
   let dir = cwd;
-  for (const segment of command.split(/&&|\|\||[;|\n]/)) {
+  for (const segment of segments(command)) {
     const words = tokens(segment);
     if (words[0] === 'cd' && words[1]) dir = within(dir, words[1]);
     else if (words[0] === 'git') {
@@ -70,7 +90,7 @@ const MERGE_WITH_VALUE = new Set(['-b', '--body', '-F', '--body-file', '-t', '--
 export function ownMerges(command: string, cwd: string): OwnMerge[] {
   const found: OwnMerge[] = [];
   let dir = cwd;
-  for (const segment of command.split(/&&|\|\||[;|\n]/)) {
+  for (const segment of segments(command)) {
     const words = tokens(segment);
     if (words[0] === 'cd' && words[1]) dir = within(dir, words[1]);
     if (words[0] !== 'gh' || words[1] !== 'pr' || words[2] !== 'merge') continue;
@@ -96,8 +116,10 @@ export function ownMerges(command: string, cwd: string): OwnMerge[] {
 /** Git Bash spells `C:\x` as `/c/x`; Node on Windows reads that as `\c\x` on the current drive, where git cannot start (spawn ENOENT). */
 export const nativePath = (path: string, platform: string = process.platform) =>
   platform === 'win32' ? path.replace(/^\/([A-Za-z])(?:\/|$)/, (_, drive: string) => `${drive.toUpperCase()}:/`) : path;
+/** `~` and `$HOME` are the user's home folder; the shell has expanded them by the time git runs, but not in the command text. */
+const home = (path: string) => path.replace(/^(?:~|\$HOME|\$\{HOME\})(?=\/|\\|$)/, () => homedir().replace(/\\/g, '/'));
 const within = (dir: string, path: string) => {
-  const native = nativePath(path);
+  const native = nativePath(home(path));
   return isAbsolute(native) || /^[A-Za-z]:[\\/]/.test(native) ? native : resolve(dir, native);
 };
 

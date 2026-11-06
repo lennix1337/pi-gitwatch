@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 import { test } from 'node:test';
 import { createdPrs, githubRepo, nativePath, ownMerges, pushes, resolvePush } from '../src/autowatch.ts';
@@ -31,6 +32,23 @@ test('a Git Bash drive path names the Windows folder git runs in', () => {
 test('tags, deletions, dry runs and non-push git commands are ignored', () => {
   for (const command of ['git push --tags', 'git push origin --delete old', 'git push origin :old', 'git push -n origin main',
     'git push origin refs/tags/v1', 'git log --oneline | grep push', 'echo git push']) assert.deepEqual(pushes(command, '/w'), [], command);
+});
+
+// Seen live 2026-11-05: `cd ~/.optchat/profiles/x && ...` made git run in "C:\Users\me\~\.optchat\..." (spawn ENOENT), and a
+// node -e script that merely contained "git push" inside a quoted regex was taken for a push.
+test('cd ~ and $HOME name the home folder, not a folder called ~', () => {
+  const homeDir = homedir().replaceAll('\\', '/');
+  assert.deepEqual(pushes('cd ~/proj && git push origin main', '/w'), [{ dir: `${homeDir}/proj`, remote: 'origin', branch: 'main' }]);
+  assert.deepEqual(pushes('cd "$HOME/proj" && git push origin main', '/w'), [{ dir: `${homeDir}/proj`, remote: 'origin', branch: 'main' }]);
+  assert.deepEqual(pushes('cd ~ && git push origin main', '/w'), [{ dir: homeDir, remote: 'origin', branch: 'main' }]);
+  assert.deepEqual(ownMerges('cd ~/proj && gh pr merge 5', '/w'), [{ pr: 5, dir: `${homeDir}/proj` }]);
+});
+
+test('a command inside quotes is text, not a command', () => {
+  for (const command of [`node -e "const r=/git push|git pull/; console.log(r)"`, `grep -E 'a|git push' f`, `echo "x && git push origin main"`, `echo 'x; git push'`])
+    assert.deepEqual(pushes(command, '/w'), [], command);
+  assert.deepEqual(ownMerges(`echo "ok; gh pr merge 7"`, '/w'), []);
+  assert.deepEqual(pushes(`git commit -m "a; b" && git push origin main`, '/w'), [{ dir: '/w', remote: 'origin', branch: 'main' }], 'a push after a quoted separator is still found');
 });
 
 test('a push resolves to a GitHub repository and branch through git', async () => {
