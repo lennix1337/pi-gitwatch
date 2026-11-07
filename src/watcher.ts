@@ -327,6 +327,7 @@ export class Watcher {
       const all = new Map<string, WatchEvent[]>();
       const watched = Object.entries(state.repos).filter(([repo]) => !only || repo === only);
       // Each repository is an independent read, so they are fetched together; results are still applied in order below.
+      const failed: { repo: string; failures: number; error: string }[] = [];
       const fetched = await settleBounded(watched, FETCH_CONCURRENCY, ([repo, watch]) => this.fetch(repo, watch, signal));
       for (const [index, [repo, watch]] of watched.entries()) {
         try {
@@ -353,15 +354,25 @@ export class Watcher {
         } catch (error) {
           if (signal?.aborted) throw error;
           watch.failures++; watch.lastError = error instanceof Error ? error.message : String(error);
-          if (watch.failures === FAILURES_BEFORE_NOTICE) {
-            const text = `[gitwatch] ${repo} · ${brt(this.now())}\nPolling failed ${watch.failures} times in a row: ${watch.lastError}\nThe watch keeps retrying every ${state.intervalSec}s. Check \`gh auth status\`; stop with gitwatch {"action":"unwatch","repo":"${repo}"}.`;
-            notices.push({ repo, events: [], text, wake: true });
-          }
+          if (watch.failures === FAILURES_BEFORE_NOTICE) failed.push({ repo, failures: watch.failures, error: watch.lastError });
         }
       }
+      if (failed.length) notices.push(this.failureNotice(failed, state.intervalSec));
       this.store.save(state);
       return { notices, events: all };
     });
+  }
+
+  /** One outage fails every repository together: they share a notice instead of waking the agent once each. */
+  private failureNotice(failed: { repo: string; failures: number; error: string }[], intervalSec: number): Notice {
+    const [first] = failed;
+    const many = failed.length > 1;
+    const head = `[gitwatch] ${many ? `${failed.length} repositories` : first.repo} · ${brt(this.now())}`;
+    const body = many
+      ? `Polling failed ${first.failures} times in a row for each:\n${failed.map(f => `- ${f.repo}: ${f.error}`).join('\n')}`
+      : `Polling failed ${first.failures} times in a row: ${first.error}`;
+    const stop = `gitwatch {"action":"unwatch","repo":"${first.repo}"}${many ? ' (once per repository)' : ''}`;
+    return { repo: first.repo, events: [], wake: true, text: `${head}\n${body}\nThe watch keeps retrying every ${intervalSec}s. Check \`gh auth status\`; stop with ${stop}.` };
   }
 
   private async fetch(repo: string, watch: RepoWatch, signal?: AbortSignal, extraBranch?: string) {
