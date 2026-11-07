@@ -503,3 +503,21 @@ test('a held change of the same PR and kind is superseded by the wake that state
   assert.deepEqual(notices.map(n => n.wake), [true]);
   assert.doesNotMatch(notices[0].text, /since last notice/, 'the failure already says what the running check became');
 });
+
+test('repositories failing together in one poll share a single notice that names each of them', async () => {
+  const gh = new FakeGitHub();
+  gh.set(pr(1));
+  const dir = tempDir();
+  const clock = () => Date.UTC(2026, 10, 7, 6, 2);
+  const setup = new Watcher(new Store(dir), gh.run, clock);
+  for (const repo of ['o/a', 'o/b', 'o/c']) await setup.watch(repo, { prs: [1] });
+  const down: Runner = async () => { throw new Error('error connecting to api.github.com'); };
+  const watcher = new Watcher(new Store(dir), down, clock);
+  const notices = [];
+  for (let i = 0; i < FAILURES_BEFORE_NOTICE; i++) notices.push(...(await watcher.poll()).notices);
+  assert.equal(notices.length, 1, 'one outage is one notice, not one per repository');
+  assert.equal(notices[0].wake, true);
+  for (const repo of ['o/a', 'o/b', 'o/c']) assert.match(notices[0].text, new RegExp(`${repo}`));
+  assert.match(notices[0].text, /error connecting to api\.github\.com/);
+  assert.match(notices[0].text, /unwatch/);
+});
