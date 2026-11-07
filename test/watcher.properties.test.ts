@@ -8,7 +8,7 @@ import { FakeGitHub, pr, tempDir, type Check } from './fixtures.ts';
 // restates the routing rules from the observed state, and every poll must wake exactly as often as the oracle says.
 // Seeded generator: a failing case reproduces from its seed, which every assertion message carries.
 const rng = (seed: number) => () => { seed = (seed + 0x6D2B79F5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
-const CASES = 120;
+const CASES = 200;
 type Next = () => number;
 const pick = <T>(next: Next, items: readonly T[]): T => items[Math.floor(next() * items.length)];
 
