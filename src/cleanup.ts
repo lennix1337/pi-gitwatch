@@ -23,6 +23,8 @@ export function parseWorktrees(porcelain: string): Worktree[] {
  * kept too. Returns one line per branch found.
  */
 export async function cleanMerged(git: GitRunner, clone: string, head: string): Promise<string[]> {
+  // A contributor's PR head this clone never fetched: no local branch can point at it, so there is nothing to clean.
+  try { await git(['rev-parse', '--verify', '--quiet', `${head}^{commit}`], clone); } catch { return []; }
   const refs = await git(['for-each-ref', '--points-at', head, '--format=%(refname:short)', 'refs/heads'], clone);
   const branches = refs.split(/\r?\n/).map(b => b.trim()).filter(b => b && !PROTECTED.has(b));
   if (!branches.length) return [];

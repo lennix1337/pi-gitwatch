@@ -65,3 +65,8 @@ test('a clone the agent already removed leaves no "spawn git ENOENT" note', asyn
   const gone = join(dir, 'worktrees', 'already-removed');
   assert.deepEqual(await cleanupLines(gitRunner, { clone: gone, events: [{ kind: 'merged', pr: 4, head }] }), []);
 });
+
+test('a merged head this clone never fetched (a contributor PR) leaves no "malformed object name" note', async () => {
+  const { dir } = repo();
+  assert.deepEqual(await cleanupLines(gitRunner, { clone: dir, events: [{ kind: 'merged', pr: 935, head: 'b2fff97d' }] }), []);
+});
