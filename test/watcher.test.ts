@@ -521,3 +521,43 @@ test('repositories failing together in one poll share a single notice that names
   assert.match(notices[0].text, /error connecting to api\.github\.com/);
   assert.match(notices[0].text, /unwatch/);
 });
+
+test('re-watching an auto-merge PR does not repeat a stall already reported on its head', async () => {
+  const { gh, watcher, tick } = setup();
+  gh.set(pr(9, { autoMergeRequest: {} }));
+  await watcher.watch('o/r', { prs: [9] });
+  await watcher.poll();
+  for (let i = 0; i < 21; i++) tick();
+  const first = await watcher.poll();
+  assert.match(first.notices.map(n => n.text).join('\n'), /auto-merge has not merged \d+ min after checks passed/);
+  await watcher.watch('o/r', { prs: [9] });
+  await watcher.poll();
+  for (let i = 0; i < 21; i++) tick();
+  const again = await watcher.poll();
+  assert.deepEqual(again.notices, [], 'the same head stalled once; a re-watch does not start a second clock');
+});
+
+test('a re-watch after a push starts the stall clock over for the new head', async () => {
+  const { gh, watcher, tick } = setup();
+  const stalls = (notices: { text: string }[]) => notices.filter(n => /auto-merge has not merged/.test(n.text));
+  gh.set(pr(9, { autoMergeRequest: {} }));
+  await watcher.watch('o/r', { prs: [9] });
+  await watcher.poll();
+  for (let i = 0; i < 21; i++) tick();
+  gh.set(pr(9, { autoMergeRequest: {}, headRefOid: 'b'.repeat(40) }));
+  await watcher.watch('o/r', { prs: [9] });
+  assert.deepEqual(stalls((await watcher.poll()).notices), [], 'the new head has passed for no time yet');
+  for (let i = 0; i < 21; i++) tick();
+  assert.equal(stalls((await watcher.poll()).notices).length, 1, 'the new head stalls once, 10 min after its own first pass');
+});
+
+test('a PR that merged between polls is still announced when it is followed again before the next poll', async () => {
+  const { gh, watcher, tick } = setup();
+  gh.set(pr(5));
+  await watcher.watch('o/r');
+  await watcher.poll();
+  gh.set(pr(5, { state: 'MERGED', mergeCommit: { oid: 'abcdef123456' } })); tick();
+  await watcher.watch('o/r', { prs: [5] });
+  const { notices } = await watcher.poll();
+  assert.match(notices.map(n => n.text).join('\n'), /#5 merged abcdef12/, 'the merge is not dropped by the re-watch');
+});

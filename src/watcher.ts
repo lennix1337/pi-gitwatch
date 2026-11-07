@@ -265,7 +265,7 @@ export class Watcher {
       const missing = watch.prs.filter(n => !snapshots.has(n));
       if (missing.length) throw new Error(`Not found in ${repo}: ${missing.map(n => `#${n}`).join(', ')}.`);
       if (branch && !branches.get(branch)) throw new Error(`Branch ${branch} not found in ${repo}.`);
-      for (const [n, s] of snapshots) if ((s.state === 'OPEN' && !watch.ignore?.includes(n)) || watch.prs.includes(n)) watch.snapshots[n] = keepAnnounced(settle(watch.snapshots[n], s), watch.snapshots[n]);
+      for (const [n, s] of snapshots) if (takesSnapshot(watch, n, s)) watch.snapshots[n] = keepTracked(settle(watch.snapshots[n], s), watch.snapshots[n]);
       if (branch) watch.branches![branch] = baselineBranch(branches.get(branch)!);
       if (request.subscriber) setSubscribers(watch, request.prs ?? [], branch, request.subscriber);
       this.prune(watch);
@@ -455,8 +455,26 @@ function setSubscribers(watch: RepoWatch, prs: number[], branch: string | undefi
   if (branch) subscribers[`branch:${branch}`] = label;
 }
 
-/** A snapshot taken over an earlier one keeps what the agent was already told about the PR. */
-const keepAnnounced = (next: Snapshot, prev: Snapshot | undefined): Snapshot => (prev?.announced ? { ...next, announced: prev.announced } : next);
+/**
+ * Whether a re-read PR replaces its stored snapshot. A PR that merged or closed since the last poll keeps its stored open
+ * snapshot, so the next poll announces the transition.
+ */
+const takesSnapshot = (watch: RepoWatch, n: number, s: Snapshot): boolean =>
+  ((s.state === 'OPEN' && !watch.ignore?.includes(n)) || watch.prs.includes(n)) && (s.state === 'OPEN' || watch.snapshots[n] === undefined);
+
+/**
+ * A snapshot taken over an earlier one keeps what the agent was already told about the PR, and the auto-merge stall clock of
+ * the same head: a new head starts its own clock.
+ */
+const keepTracked = (next: Snapshot, prev: Snapshot | undefined): Snapshot => {
+  if (!prev) return next;
+  const sameHead = prev.head === next.head && prev.passedAt !== undefined;
+  return {
+    ...next,
+    ...prev.announced ? { announced: prev.announced } : {},
+    ...sameHead ? { passedAt: prev.passedAt, stallReported: prev.stallReported } : {},
+  };
+};
 
 /** The watch a request leads to, before GitHub confirms its PRs and branch exist. */
 function nextWatch(existing: RepoWatch | undefined, { prs, branch }: WatchRequest): RepoWatch {
