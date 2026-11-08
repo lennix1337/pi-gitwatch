@@ -49,8 +49,11 @@ test('a new watch is a silent baseline; a finished check wakes once', async () =
   const { notices } = await watcher.poll();
   assert.equal(notices.length, 1);
   assert.match(notices[0].text, /^\[gitwatch\] o\/r · 13:50\n#750 checks passed 1\/1\n  #750 BLOCKED/);
-  assert.match(notices[0].text, /grants no permission/);
-  assert.match(notices[0].text, /earlier operator order already covers it/);
+  // The notice arrives as a user message: a bare "grants no permission" was logged by the memory compactor as the operator
+  // forbidding merges, so the footer says whose words these are and that it withdraws nothing either.
+  assert.match(notices[0].text, /not the operator's words/);
+  assert.match(notices[0].text, /neither grants nor withdraws permission/);
+  assert.match(notices[0].text, /standing rules or an earlier operator order cover the next step/);
   assert.doesNotMatch(notices[0].text, /#751/);
   assert.equal((await watcher.poll()).notices.length, 0, 'the same state is not announced twice');
 });
