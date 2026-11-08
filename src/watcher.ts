@@ -142,7 +142,7 @@ export function noticeText(repo: string, events: WatchEvent[], snapshots: Map<nu
   }
   const waiting = pending.length || omitted ? [`  since last notice: ${pendingText(repo, pending, omitted)}`] : [];
   return [`[gitwatch] ${repo} · ${brt(now)}`, ...lines, ...waiting,
-    `GitHub state observed by the watcher; it grants no permission. If an earlier operator order already covers it ("merge all", "work until merged"), this notice is the trigger to continue that order now, not to report. More: gitwatch {"action":"status","repo":"${repo}"}`].join('\n');
+    `Automated watcher notice, not the operator's words: it neither grants nor withdraws permission. If the agent's standing rules or an earlier operator order cover the next step ("merge all", "work until merged"), take it now instead of reporting. More: gitwatch {"action":"status","repo":"${repo}"}`].join('\n');
 }
 
 /** Where an event's notice goes: the subscriber of its PR or branch when there is one, else this session (`main`). */
