@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, writeFileSync } from 'node:fs';
+import { existsSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { gitRunner } from '../src/autowatch.ts';
@@ -69,4 +69,32 @@ test('a clone the agent already removed leaves no "spawn git ENOENT" note', asyn
 test('a merged head this clone never fetched (a contributor PR) leaves no "malformed object name" note', async () => {
   const { dir } = repo();
   assert.deepEqual(await cleanupLines(gitRunner, { clone: dir, events: [{ kind: 'merged', pr: 935, head: 'b2fff97d' }] }), []);
+});
+
+test('a worktree folder deleted by hand is pruned and its merged branch removed', async () => {
+  const { dir, head, clean, git } = repo();
+  rmSync(clean, { recursive: true, force: true });
+  assert.match(git('worktree', 'list', '--porcelain'), /prunable/);
+  const calls: string[] = [];
+  const spy: typeof gitRunner = (args, cwd) => { calls.push(args.slice(0, 3).join(' ')); return gitRunner(args, cwd); };
+  const lines = await cleanMerged(spy, dir, head);
+  assert.ok(calls.includes('worktree prune'), calls.join('\n'));
+  assert.ok(!calls.some(c => c.startsWith('worktree remove') && c.includes('clean')), calls.join('\n'));
+  assert.ok(lines.some(l => l.startsWith('removed worktree') && l.endsWith('and branch wt-done')), lines.join('\n'));
+  assert.doesNotMatch(git('branch', '--format=%(refname:short)'), /wt-done/);
+  assert.doesNotMatch(git('worktree', 'list', '--porcelain'), /worktrees[\/]clean/);
+});
+
+test('cleanup runs git from the main worktree even when the notice names a linked one', async () => {
+  const { dir, head, dirty, clean, git } = repo();
+  const cwds: string[] = [];
+  const spy: typeof gitRunner = (args, cwd) => { cwds.push(`${args.slice(0, 2).join(' ')}@${cwd}`); return gitRunner(args, cwd); };
+  await cleanMerged(spy, dirty, head);
+  const norm = (p: string) => p.replaceAll('\\', '/').toLowerCase();
+  const main = norm(git('rev-parse', '--show-toplevel'));
+  const removes = cwds.filter(c => c.startsWith('worktree remove@') || c.startsWith('branch -D@'));
+  assert.ok(removes.length >= 2, cwds.join('\n'));
+  for (const c of removes) assert.equal(norm(c.slice(c.indexOf('@') + 1)), main, c);
+  assert.equal(existsSync(clean), false);
+  assert.equal(existsSync(join(dirty, 'wip.txt')), true);
 });
