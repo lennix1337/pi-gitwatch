@@ -19,7 +19,7 @@ export function parseWorktrees(porcelain: string): Worktree[] {
 /**
  * After a PR merged, removes the local branches of `clone` that still point exactly at its head commit (so every commit
  * they hold is in the merged PR), and the linked worktree that has one checked out. Git refuses to remove a worktree
- * with modified or untracked files, so uncommitted work is kept; the main worktree's branch and long-lived branches are
+ * with modified or untracked files, so uncommitted work is kept; a worktree whose folder is already gone is pruned; the main worktree's branch and long-lived branches are
  * kept too. Returns one line per branch found.
  */
 export async function cleanMerged(git: GitRunner, clone: string, head: string): Promise<string[]> {
@@ -29,13 +29,16 @@ export async function cleanMerged(git: GitRunner, clone: string, head: string): 
   const branches = refs.split(/\r?\n/).map(b => b.trim()).filter(b => b && !PROTECTED.has(b));
   if (!branches.length) return [];
   const trees = parseWorktrees(await git(['worktree', 'list', '--porcelain'], clone));
+  // Mutate from the main worktree: `clone` may be a linked worktree that is itself about to go away or is unrelated.
+  const main = trees[0]?.path && existsSync(trees[0].path) ? trees[0].path : clone;
   const lines: string[] = [];
   for (const branch of branches) {
     const tree = trees.find(t => t.branch === branch);
     if (tree?.main) { lines.push(`kept ${branch}: checked out in ${tree.path}`); continue; }
     try {
-      if (tree) await git(['worktree', 'remove', tree.path], clone);
-      await git(['branch', '-D', branch], clone);
+      // A worktree whose folder is already gone (git lists it as prunable) has nothing to remove: drop its record.
+      if (tree) await git(existsSync(tree.path) ? ['worktree', 'remove', tree.path] : ['worktree', 'prune'], main);
+      await git(['branch', '-D', branch], main);
       lines.push(`removed ${tree ? `worktree ${tree.path} and ` : ''}branch ${branch}`);
     } catch (error) {
       // execFile puts git's stderr after a "Command failed" line; its last line names the reason.
