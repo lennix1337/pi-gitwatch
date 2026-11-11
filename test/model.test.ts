@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { AUTO_MERGE_STALL_MS, autoMergeStall, branchDiff, branchHint, branchLine, diff, hint, jobsText, line, normalize, normalizeBranch, settle, summarizeChecks, type WatchEvent } from '../src/model.ts';
-import { announce, routeEvent } from '../src/route.ts';
+import { announce, handledMerge, routeEvent } from '../src/route.ts';
 import type { RawPullRequest } from '../src/model.ts';
 import { commit, pr } from './fixtures.ts';
 
@@ -179,4 +179,20 @@ test('routing: a merge this session made is ignored, a quiet change is a candida
   assert.deepEqual(routeEvent(passed, { cur: next, announced }), { route: 'respond', reason: 'wake' }, 'a new head is announced again');
   const failed: WatchEvent = { pr: 1, kind: 'checks', text: 'checks failed: test', wake: true };
   assert.deepEqual(routeEvent(failed, { cur: normalize(pr(1, {}, [['test', 'COMPLETED', 'FAILURE']])), announced }), { route: 'respond', reason: 'wake' }, 'a failure is never a repeat');
+});
+
+test('a merge of a PR queued with auto-merge carries that fact; only then, and only when settled, is it lowered to a quiet candidate', () => {
+  const queued = normalize(pr(31, { autoMergeRequest: {} }));
+  const done = normalize(pr(31, { state: 'MERGED', autoMergeRequest: {}, mergeCommit: { oid: 'cf5d0007aaaa' } }));
+  const [auto] = diff(queued, done);
+  assert.equal(auto.auto, true);
+  assert.equal(diff(normalize(pr(31)), done)[0].auto, undefined, 'a PR nobody queued is not an auto-merge');
+  const respond = routeEvent(auto);
+  assert.deepEqual(respond, { route: 'respond', reason: 'wake' }, 'by itself a merge still wakes');
+  assert.deepEqual(handledMerge(respond, auto, true), { route: 'candidate', reason: 'handled' });
+  assert.deepEqual(handledMerge(respond, auto, false), respond, 'something stayed behind or nothing was cleaned');
+  assert.deepEqual(handledMerge(routeEvent(diff(normalize(pr(31)), done)[0]), diff(normalize(pr(31)), done)[0], true), respond, 'a merge nobody queued here');
+  const failed: WatchEvent = { pr: 1, kind: 'closed', text: 'closed without merge', wake: true };
+  assert.deepEqual(handledMerge(routeEvent(failed), failed, true), { route: 'respond', reason: 'wake' }, 'only merges are lowered');
+  assert.equal(diff(normalize(pr(32, { autoMergeRequest: {} }, [['t', 'COMPLETED', 'SUCCESS']])), normalize(pr(32, { autoMergeRequest: {}, mergeStateStatus: 'CLEAN' }, [['t', 'COMPLETED', 'SUCCESS']]))).every(e => !e.wake), true, 'green checks with auto-merge never wake');
 });

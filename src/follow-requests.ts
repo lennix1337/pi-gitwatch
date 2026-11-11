@@ -7,7 +7,11 @@ import { REPO } from './github.ts';
  * in its own process (pi-optchat's ship.mjs), or a command moved to a background shell, never reaches `tool_result`
  * with the PR URL, so its PR was never followed and its merge woke nobody (03/11: #91, #92, #94).
  */
-export interface FollowRequest { repo: string; pr: number }
+export interface FollowRequest {
+  repo: string; pr: number;
+  /** The checkout the PR was pushed from (a linked worktree is fine): where its merged branches are cleaned afterwards. */
+  clone?: string;
+}
 
 const folder = (dir: string) => join(dir, 'follow');
 
@@ -30,7 +34,9 @@ export function pendingFollows(dir: string): { request: FollowRequest; done: () 
     const done = () => rmSync(file, { force: true });
     try {
       const r = JSON.parse(readFileSync(file, 'utf8')) as Partial<FollowRequest>;
-      if (typeof r.repo === 'string' && REPO.test(r.repo) && Number.isInteger(r.pr) && r.pr! > 0) found.push({ request: { repo: r.repo, pr: r.pr! }, done });
+      if (typeof r.repo === 'string' && REPO.test(r.repo) && Number.isInteger(r.pr) && r.pr! > 0) {
+        found.push({ request: { repo: r.repo, pr: r.pr!, ...typeof r.clone === 'string' && r.clone ? { clone: r.clone } : {} }, done });
+      }
       else done();
     } catch { done(); }
   }

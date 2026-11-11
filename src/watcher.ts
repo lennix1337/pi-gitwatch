@@ -7,7 +7,7 @@ import {
   autoMergeStall, baselineBranch, branchDiff, branchHint, branchLine, brt, diff, hint, jobsText, line, normalize, normalizeBranch, settle,
   type Announced, type BranchSnapshot, type RawCommit, type Snapshot, type WatchEvent,
 } from './model.ts';
-import { announce, routeEvent, type Decision } from './route.ts';
+import { announce, handledMerge, routeEvent, type Decision } from './route.ts';
 
 export interface RepoWatch {
   /** `open`: every open PR, including ones opened later. `list`: only `prs`, dropped once merged or closed. */
@@ -151,8 +151,8 @@ function targetOf(watch: RepoWatch, e: WatchEvent): string {
   return label ? `sub:${label}` : 'main';
 }
 
-/** One event per PR (or branch) and kind in a batch: a newer one replaces the older. */
-const itemKey = (e: WatchEvent) => `${e.branch !== undefined ? `branch ${e.branch}` : `pr ${e.pr}`}|${e.kind}`;
+/** One event per PR (or branch) and kind in a batch: a newer one replaces the older. Cleanup lines are separate facts: each is kept. */
+const itemKey = (e: WatchEvent) => `${e.branch !== undefined ? `branch ${e.branch}` : `pr ${e.pr}`}|${e.kind}${e.kind === 'cleanup' ? `|${e.text}` : ''}`;
 
 /** Adds candidates to a target's batch, keeping at most MAX_HELD items; the batch keeps the time its first item arrived. */
 function mergeHeld(held: Held | undefined, incoming: WatchEvent[], now: number): Held {
@@ -338,7 +338,9 @@ export class Watcher {
           const shown = new Map(Object.values(watch.snapshots).map(s => [s.number, s]));
           const shownBranches = new Map(Object.entries(watch.branches ?? {}));
           const { clone } = watch;
-          const cleanups = await cleanupEvents(watch, routed, options.cleanup);
+          const { events: cleanups, settled } = await cleanupEvents(watch, routed, options.cleanup);
+          // An auto-merge whose cleanup left nothing to do needs no turn: it is delivered with the next one.
+          for (const r of routed) r.decision = handledMerge(r.decision, r.event, settled.has(r.event.pr));
           countRoutes(state, this.now(), routed);
           forgetOwnMerges(watch, routed);
           const planned = planNotices(repo, watch, routed, cleanups, shown, shownBranches, this.now(), clone);
@@ -539,13 +541,19 @@ function advanceBranches(watch: RepoWatch, branches: Map<string, BranchSnapshot>
   return out;
 }
 
-/** Local cleanup for the merged PRs of this poll, whatever their route: a merge this session made still cleans its branches. */
-async function cleanupEvents(watch: RepoWatch, routed: Routed[], cleanup?: PollOptions['cleanup']): Promise<WatchEvent[]> {
+/**
+ * Local cleanup for the merged PRs of this poll, whatever their route: a merge this session made still cleans its
+ * branches. `settled` holds the PRs whose cleanup ran and left nothing for the agent; no known clone settles none.
+ */
+async function cleanupEvents(watch: RepoWatch, routed: Routed[], cleanup?: PollOptions['cleanup']): Promise<{ events: WatchEvent[]; settled: Set<number> }> {
   const clone = watch.clone;
   const merged = routed.map(r => r.event).filter(e => e.kind === 'merged' && e.head !== undefined);
-  if (!cleanup || !clone || !merged.length) return [];
+  if (!cleanup || !clone || !merged.length) return { events: [], settled: new Set() };
   const lines = await cleanup({ clone, events: merged });
-  return lines.map(l => ({ pr: l.pr, kind: 'cleanup' as const, text: `${l.text} (in ${clone})`, wake: false }));
+  const left = new Set(lines.filter(l => l.left).map(l => l.pr));
+  // Fast-forward and reload lines already name their folder; the others are about the clone the push came from.
+  const events = lines.map(l => ({ pr: l.pr, kind: 'cleanup' as const, text: /^(reload needed|fast-forwarded|skipped fast-forward)/.test(l.text) ? l.text : `${l.text} (in ${clone})`, wake: false }));
+  return { events, settled: new Set(merged.map(e => e.pr).filter(pr => !left.has(pr))) };
 }
 
 function countRoutes(state: State, now: number, routed: Routed[]) {

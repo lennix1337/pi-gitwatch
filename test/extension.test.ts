@@ -1,13 +1,17 @@
 import assert from 'node:assert/strict';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { test } from 'node:test';
 import extension, { Lease, MESSAGE_TYPE } from '../src/index.ts';
 import { SUBSCRIBER_NOTICE_CHANNEL, type SubscriberNotice } from '../src/subscribers.ts';
+import { gitRunner, type GitRunner } from '../src/autowatch.ts';
 import { Store } from '../src/watcher.ts';
 import { pendingFollows, requestFollow } from '../src/follow-requests.ts';
-import { commit, FakeGitHub, pr, tempDir } from './fixtures.ts';
+import { commit, FakeGitHub, gitWorld, pr, run, tempDir } from './fixtures.ts';
 
 type Handler = (event: unknown, ctx: { mode: string; cwd?: string; hasUI?: boolean; ui?: { notify: (text: string) => void } }) => unknown;
-function harness(mode = 'tui', dir = tempDir(), send?: () => void | Promise<void>) {
+/** `git` answers the extension's git calls (default: a fake of o/r on main); `packages` are the loaded Pi packages (default: none, never the real settings). */
+function harness(mode = 'tui', dir = tempDir(), send?: () => void | Promise<void>, over: { git?: GitRunner; packages?: string[] } = {}) {
   const gh = new FakeGitHub();
   const handlers = new Map<string, Handler>();
   const sent: { message: { customType: string; content: string }; options: unknown }[] = [];
@@ -26,7 +30,7 @@ function harness(mode = 'tui', dir = tempDir(), send?: () => void | Promise<void
     sendMessage: (message: { customType: string; content: string }, options: unknown) => { sent.push({ message, options }); return send?.(); },
     events,
   };
-  extension(pi as never, { run: gh.run, git: async args => args[0] === 'remote' ? 'https://github.com/o/r.git' : 'main', store: new Store(dir), schedule: fn => { timers.push(fn); return timers.length; }, cancel: () => {} });
+  extension(pi as never, { run: gh.run, git: over.git ?? (async args => args[0] === 'remote' ? 'https://github.com/o/r.git' : 'main'), packages: () => over.packages ?? [], store: new Store(dir), schedule: fn => { timers.push(fn); return timers.length; }, cancel: () => {} });
   handlers.get('session_start')!({}, { mode, hasUI: true, ui: { notify: text => warnings.push(text) } });
   const call = (params: Record<string, unknown>) => tool!.execute('id', params, undefined, undefined, {});
   /** Runs the scheduled poll and waits for it to settle. */
@@ -216,6 +220,76 @@ test('a PR another process asks to follow (ship.mjs, a background shell) is foll
   await h.fire();
   assert.equal(h.sent.length, 1);
   assert.match(h.sent[0].message.content, /#32 merged cf5d0032/);
+  assert.deepEqual(h.sent[0].options, { triggerTurn: true, deliverAs: 'steer' });
+});
+
+/** A repository `o/r` whose main checkout the agent leaves clean, and a feature branch checked out in a linked worktree, as scripts/ship.mjs leaves them. */
+function shipped() {
+  const w = gitWorld();
+  run(w.main, 'remote', 'set-url', 'origin', w.origin);
+  const linked = join(w.main, '.worktrees', 'feat-x');
+  run(w.main, 'worktree', 'add', '-q', '-b', 'feat/x', linked);
+  const head = run(linked, 'rev-parse', 'HEAD');
+  // GitHub's squash merge lands on origin/main; the PR head is the branch commit.
+  w.merge();
+  const git: GitRunner = (args, cwd) => args[0] === 'remote' && args[1] === 'get-url' && cwd === w.main ? Promise.resolve('https://github.com/o/r.git') : gitRunner(args, cwd);
+  return { ...w, linked, head, git };
+}
+const merged = (n: number, head: string) => pr(n, { state: 'MERGED', autoMergeRequest: {}, headRefOid: head.padEnd(40, '0'), mergeCommit: { oid: 'cf5d0032aaaa' } });
+
+test('a PR a script follows from a linked worktree is cleaned up, the main checkout fast-forwarded, and the merge is delivered without a turn', async () => {
+  const s = shipped();
+  const h = harness('tui', tempDir(), undefined, { git: s.git });
+  h.gh.set(pr(33, { autoMergeRequest: {}, headRefOid: s.head.padEnd(40, '0') }, [['test', 'IN_PROGRESS']]));
+  requestFollow(h.dir, { repo: 'o/r', pr: 33, clone: s.linked });
+  await h.fire();
+  h.gh.set(merged(33, s.head));
+  await h.fire();
+  assert.equal(h.sent.length, 1);
+  assert.deepEqual(h.sent[0].options, { deliverAs: 'nextTurn' });
+  assert.match(h.sent[0].message.content, /#33 merged cf5d0032/);
+  assert.match(h.sent[0].message.content, /removed worktree .*feat-x and branch feat\/x/);
+  assert.match(h.sent[0].message.content, /fast-forwarded main in /);
+  assert.equal(existsSync(s.linked), false);
+  assert.equal(run(s.main, 'rev-parse', 'HEAD'), run(s.other, 'rev-parse', 'HEAD'));
+});
+
+test('the same merge wakes the agent when the main checkout is dirty, naming why it was not updated', async () => {
+  const s = shipped();
+  writeFileSync(join(s.main, 'a.txt'), 'wip');
+  const h = harness('tui', tempDir(), undefined, { git: s.git });
+  h.gh.set(pr(34, { autoMergeRequest: {}, headRefOid: s.head.padEnd(40, '0') }, [['test', 'IN_PROGRESS']]));
+  requestFollow(h.dir, { repo: 'o/r', pr: 34, clone: s.linked });
+  await h.fire();
+  h.gh.set(merged(34, s.head));
+  await h.fire();
+  assert.deepEqual(h.sent[0].options, { triggerTurn: true, deliverAs: 'steer' });
+  assert.match(h.sent[0].message.content, /skipped fast-forward of .*: it has uncommitted changes/);
+  assert.equal(readFileSync(join(s.main, 'a.txt'), 'utf8'), 'wip');
+});
+
+test('a script that names no clone: the loaded Pi package of that repository is the checkout (root cause of #270-#274 never being cleaned), and its merge is quiet, carrying the reload line', async () => {
+  const s = shipped();
+  const h = harness('tui', tempDir(), undefined, { git: s.git, packages: [s.main] });
+  h.gh.set(pr(35, { autoMergeRequest: {}, headRefOid: s.head.padEnd(40, '0') }, [['test', 'IN_PROGRESS']]));
+  requestFollow(h.dir, { repo: 'o/r', pr: 35 });
+  await h.fire();
+  h.gh.set(merged(35, s.head));
+  await h.fire();
+  assert.equal(h.sent.length, 1);
+  assert.deepEqual(h.sent[0].options, { deliverAs: 'nextTurn' }, 'a loaded package whose cleanup and fast-forward went fine needs no turn');
+  assert.match(h.sent[0].message.content, /fast-forwarded main in /);
+  assert.match(h.sent[0].message.content, /reload needed: .* is a loaded Pi package/);
+  assert.equal(run(s.main, 'rev-parse', 'HEAD'), run(s.other, 'rev-parse', 'HEAD'));
+});
+
+test('a script that names no clone for a repository that is not a loaded package: no cleanup is possible, so the merge wakes', async () => {
+  const h = harness('tui', tempDir(), undefined, { packages: [tempDir()] });
+  h.gh.set(pr(36, { autoMergeRequest: {} }, [['test', 'IN_PROGRESS']]));
+  requestFollow(h.dir, { repo: 'o/r', pr: 36 });
+  await h.fire();
+  h.gh.set(merged(36, 'abcdef12'));
+  await h.fire();
   assert.deepEqual(h.sent[0].options, { triggerTurn: true, deliverAs: 'steer' });
 });
 

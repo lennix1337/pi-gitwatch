@@ -564,3 +564,82 @@ test('a PR that merged between polls is still announced when it is followed agai
   const { notices } = await watcher.poll();
   assert.match(notices.map(n => n.text).join('\n'), /#5 merged abcdef12/, 'the merge is not dropped by the re-watch');
 });
+
+/** A queued auto-merge PR watched with a clone, then merged: the poll that sees the merge, with `cleanup` answering. */
+async function mergedAfterQueue(lines: { text: string; left?: true }[] | 'throws', over: { auto?: boolean; clone?: string | null } = {}) {
+  const { gh, watcher, tick } = setup();
+  const auto = over.auto ?? true;
+  gh.set(pr(90, auto ? { autoMergeRequest: {} } : {}, [['test', 'IN_PROGRESS']]));
+  await watcher.watch('o/r', { prs: [90], ...over.clone === null ? {} : { clone: over.clone ?? '/work/clone' } });
+  gh.set(pr(90, { state: 'MERGED', mergeCommit: { oid: 'abc12345ffff' } })); tick();
+  const { notices } = await watcher.poll(undefined, undefined, {
+    cleanup: async ({ events }) => {
+      if (lines === 'throws') throw new Error('git exploded');
+      return events.flatMap(e => lines.map(l => ({ pr: e.pr, ...l })));
+    },
+  });
+  return { notices, watcher };
+}
+
+test('an auto-merge whose cleanup left nothing is reported without a turn, with its cleanup lines', async () => {
+  const { notices, watcher } = await mergedAfterQueue([{ text: 'removed worktree /w/x and branch feat/x' }, { text: 'fast-forwarded main in /work/main to abc1234 (1 commit)' }]);
+  assert.equal(notices.length, 1);
+  assert.equal(notices[0].wake, false);
+  assert.match(notices[0].text, /#90 merged abc12345/);
+  assert.match(notices[0].text, /removed worktree \/w\/x and branch feat\/x \(in \/work\/clone\)/);
+  assert.match(notices[0].text, /fast-forwarded main in \/work\/main to abc1234 \(1 commit\)(?! \(in)/);
+  assert.equal(watcher.state().routes?.respond, 0, 'the merge was routed as a candidate, not a respond');
+  assert.equal(watcher.state().routes?.candidate, 1);
+});
+
+test('an auto-merge with nothing local to clean (branch already gone) is quiet too', async () => {
+  const { notices } = await mergedAfterQueue([]);
+  assert.deepEqual(notices.map(n => n.wake), [false]);
+});
+
+test('a merge wakes when cleanup or the fast-forward left something: kept branch, skipped fast-forward', async () => {
+  for (const line of [
+    { text: 'kept feat/x: contains modified or untracked files', left: true as const },
+    { text: 'skipped fast-forward of /work/main: it has uncommitted changes', left: true as const },
+  ]) {
+    const { notices } = await mergedAfterQueue([line]);
+    assert.deepEqual(notices.map(n => n.wake), [true], line.text);
+    assert.match(notices[0].text, new RegExp(line.text.split(':')[0]));
+  }
+});
+
+test('a loaded Pi package whose cleanup and fast-forward went fine: the merge is quiet and the reload line rides along', async () => {
+  const { notices, watcher } = await mergedAfterQueue([{ text: 'removed branch feat/x' }, { text: 'fast-forwarded main in /work/main to abc1234 (1 commit)' }, { text: 'reload needed: /work/main is a loaded Pi package' }]);
+  assert.deepEqual(notices.map(n => n.wake), [false]);
+  assert.match(notices[0].text, /#90 merged abc12345/);
+  assert.match(notices[0].text, /reload needed: \/work\/main is a loaded Pi package(?! \(in)/);
+  assert.equal(watcher.state().routes?.candidate, 1);
+  assert.equal(watcher.state().routes?.respond, 0);
+});
+
+test('a loaded Pi package still wakes when its fast-forward was skipped, with the reload line in the same notice', async () => {
+  const { notices } = await mergedAfterQueue([{ text: 'skipped fast-forward of /work/main: it has uncommitted changes', left: true }, { text: 'reload needed: /work/main is a loaded Pi package' }]);
+  assert.deepEqual(notices.map(n => n.wake), [true]);
+  assert.match(notices[0].text, /skipped fast-forward[\s\S]*reload needed/);
+});
+
+test('a merge wakes when the cleanup itself fails', async () => {
+  const { gh, watcher, tick } = setup();
+  gh.set(pr(90, { autoMergeRequest: {} }, [['test', 'IN_PROGRESS']]));
+  await watcher.watch('o/r', { prs: [90], clone: '/work/clone' });
+  gh.set(pr(90, { state: 'MERGED', mergeCommit: { oid: 'abc12345ffff' } })); tick();
+  const { cleanupLines } = await import('../src/cleanup.ts');
+  const { notices } = await watcher.poll(undefined, undefined, { cleanup: notice => cleanupLines(async () => { throw new Error('git exploded'); }, notice) });
+  assert.deepEqual(notices.map(n => n.wake), [true]);
+  assert.match(notices[0].text, /cleanup skipped/);
+});
+
+test('a merge that was not queued with auto-merge (someone merged it) still wakes, even with a clean cleanup', async () => {
+  const { notices } = await mergedAfterQueue([{ text: 'removed branch feat/x' }], { auto: false });
+  assert.deepEqual(notices.map(n => n.wake), [true]);
+});
+
+test('a merge without a known clone wakes: nothing was cleaned or fast-forwarded', async () => {
+  const { notices } = await mergedAfterQueue([], { clone: null });
+  assert.deepEqual(notices.map(n => n.wake), [true]);
+});

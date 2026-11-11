@@ -5,7 +5,7 @@ import type { Announced, Slot, Snapshot, WatchEvent } from './model.ts';
  * the next notice, `ignore` is counted in status and never sent.
  */
 export type Route = 'respond' | 'candidate' | 'ignore';
-export interface Decision { route: Route; reason: 'wake' | 'quiet' | 'repeat' | 'own-merge' }
+export interface Decision { route: Route; reason: 'wake' | 'quiet' | 'repeat' | 'own-merge' | 'handled' }
 
 /** A positive confirmation on this head: checks passed or ready to merge. Only these are suppressed once announced. */
 export function confirmation(e: WatchEvent, cur: Snapshot): { slot: Slot; value: string } | undefined {
@@ -30,7 +30,8 @@ export function announce(announced: Announced | undefined, e: WatchEvent, cur: S
 /**
  * The rules, in order: a merge this session performed is already known (ignored); an event that does not wake is a
  * candidate; a confirmation the agent was already told about on this head is a repeat (candidate); everything else
- * wakes. Failures, conflicts, reviews, stalls, closes and merges nobody here performed always wake.
+ * wakes. Failures, conflicts, reviews, stalls, closes and merges nobody here performed always wake; an auto-merge
+ * wakes too until `handledMerge` finds nothing left for the agent.
  */
 export function routeEvent(e: WatchEvent, ctx: { ownMerge?: boolean; cur?: Snapshot; announced?: Announced } = {}): Decision {
   if (e.kind === 'merged' && ctx.ownMerge) return { route: 'ignore', reason: 'own-merge' };
@@ -38,4 +39,13 @@ export function routeEvent(e: WatchEvent, ctx: { ownMerge?: boolean; cur?: Snaps
   const c = ctx.cur && confirmation(e, ctx.cur);
   if (c && ctx.announced?.[c.slot] === c.value) return { route: 'candidate', reason: 'repeat' };
   return { route: 'respond', reason: 'wake' };
+}
+
+/**
+ * A merge that waited in the queue of this session (auto-merge) and whose local cleanup left nothing for the agent is
+ * only reported: it becomes a candidate that is flushed at once without a turn. `settled` is false when no cleanup ran
+ * (no known clone) or any of its lines says something stayed behind (kept branch, skipped fast-forward, reload).
+ */
+export function handledMerge(decision: Decision, e: WatchEvent, settled: boolean): Decision {
+  return decision.route === 'respond' && e.kind === 'merged' && e.auto === true && settled ? { route: 'candidate', reason: 'handled' } : decision;
 }

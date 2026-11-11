@@ -38,7 +38,11 @@ export interface BranchSnapshot { branch: string; head: string; headline: string
 export type EventKind = 'opened' | 'merged' | 'closed' | 'reopened' | 'push' | 'checks' | 'mergeState' | 'review' | 'ready' | 'draft' | 'stall' | 'cleanup';
 /** `pr` is 0 for branch and watcher events; `branch` names the branch of a branch event. */
 /** `head` is the merged commit of a `merged` event's PR head, so local branches still pointing at it can be cleaned. */
-export interface WatchEvent { pr: number; branch?: string; kind: EventKind; text: string; wake: boolean; head?: string }
+export interface WatchEvent {
+  pr: number; branch?: string; kind: EventKind; text: string; wake: boolean; head?: string;
+  /** A merge: the PR had auto-merge queued, so the merge was expected and may be reported quietly once nothing is left to do. */
+  auto?: true;
+}
 
 interface RawContext {
   __typename?: string; name?: string; status?: string; conclusion?: string | null; context?: string; state?: string;
@@ -151,15 +155,15 @@ const MERGE_STATE_TEXT: Record<string, string> = {
 
 /**
  * The transitions from `prev` to `cur`. `wake` marks those the agent must act on; the rest ride along in the same notice.
- * A merge always wakes, auto-merge or not: the next step (pull, release, reload, cleanup) waits on it, and a quiet
- * note would only surface when the operator next writes.
+ * A merge starts as a wake: the next step (pull, release, reload, cleanup) waits on it. The poll lowers it to a quiet
+ * note (`handledMerge` in route.ts) only for an auto-merge whose local cleanup left nothing for the agent.
  */
 export function diff(prev: Snapshot | undefined, cur: Snapshot): WatchEvent[] {
   const pr = cur.number;
   // A PR first seen already merged or closed has nothing to announce: it was not opened under this watch.
   if (!prev) return cur.state === 'OPEN' ? [{ pr, kind: 'opened', text: `opened by ${cur.author}`, wake: false }] : [];
   if (cur.state !== prev.state) {
-    if (cur.state === 'MERGED') return [{ pr, kind: 'merged', text: `merged${cur.mergeCommit ? ` ${cur.mergeCommit}` : ''}`, wake: true, head: cur.head }];
+    if (cur.state === 'MERGED') return [{ pr, kind: 'merged', text: `merged${cur.mergeCommit ? ` ${cur.mergeCommit}` : ''}`, wake: true, head: cur.head, ...prev.auto ? { auto: true as const } : {} }];
     if (cur.state === 'CLOSED') return [{ pr, kind: 'closed', text: 'closed without merge', wake: true }];
     return [{ pr, kind: 'reopened', text: 'reopened', wake: true }];
   }
