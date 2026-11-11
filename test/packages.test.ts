@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { writeFileSync } from 'node:fs';
+import { mkdirSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { isLoadedPackage, loadedPackages, normalizePath, packageClone } from '../src/packages.ts';
@@ -45,4 +45,30 @@ test('the clone for a repository is the loaded package whose origin is that repo
   assert.equal(await packageClone('o/b', packages, git), '/p/b', 'case-insensitive, https or ssh');
   assert.equal(await packageClone('o/a', packages, git), '/p/a');
   assert.equal(await packageClone('o/zzz', packages, git), undefined);
+});
+
+/** A real folder and a second spelling of it (a junction on Windows, a symlink elsewhere): what 8.3 short names or a linked temp dir look like to a string comparison. */
+function twoSpellings() {
+  const root = tempDir();
+  const real = join(root, 'real-folder-with-a-long-name');
+  const alias = join(root, 'ALIAS');
+  mkdirSync(join(real, 'pkg'), { recursive: true });
+  symlinkSync(real, alias, 'junction');
+  return { real, alias, pkg: join(real, 'pkg'), aliased: join(alias, 'pkg') };
+}
+
+test('two spellings of one existing folder (short 8.3 name, junction, symlink) compare equal', () => {
+  const { pkg, aliased } = twoSpellings();
+  assert.notEqual(pkg.toLowerCase(), aliased.toLowerCase(), 'the spellings differ as strings');
+  assert.equal(normalizePath(aliased), normalizePath(pkg));
+  assert.equal(normalizePath(`${aliased}/`), normalizePath(pkg));
+  assert.equal(isLoadedPackage(aliased, [pkg]), true);
+  assert.equal(isLoadedPackage(pkg, [aliased]), true);
+  assert.equal(normalizePath(pkg), normalizePath(realpathSync.native(pkg)));
+});
+
+test('a folder that does not exist is compared by its plain normalized spelling', () => {
+  const { alias } = twoSpellings();
+  assert.equal(normalizePath(join(alias, 'missing')), normalizePath(join(alias, 'missing/')));
+  assert.equal(isLoadedPackage(join(alias, 'missing'), [join(alias, 'other')]), false);
 });

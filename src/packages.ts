@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve, win32 } from 'node:path';
 import { githubRepo, type GitRunner } from './autowatch.ts';
@@ -12,9 +12,18 @@ const DRIVE = /^[A-Za-z]:[\\/]/;
 const absolute = (path: string, base: string) =>
   (DRIVE.test(path) ? win32.normalize(path) : resolve(base, path)).replace(/\\/g, '/').replace(/\/+$/, '');
 
-/** The same, case-folded where the filesystem ignores case (Windows, drive paths): the spelling two paths are compared in. */
+/**
+ * The folder the filesystem says `full` is: 8.3 short names (`RUNNER~1`), junctions and symlinks come out in one long
+ * spelling. A path that does not exist (or is a drive path on a POSIX host) keeps its plain spelling.
+ */
+function canonical(full: string): string {
+  if (DRIVE.test(full) && process.platform !== 'win32') return full;
+  try { return absolute(realpathSync.native(full), '/'); } catch { return full; }
+}
+
+/** The spelling two paths are compared in: canonical, then case-folded where the filesystem ignores case (Windows, drive paths). */
 export const normalizePath = (path: string, platform: string = process.platform) => {
-  const full = absolute(path, '/');
+  const full = canonical(absolute(path, '/'));
   return platform === 'win32' || DRIVE.test(path) ? full.toLowerCase() : full;
 };
 
