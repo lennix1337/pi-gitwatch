@@ -9,7 +9,7 @@ import { pendingFollows } from './follow-requests.ts';
 import { BRANCH, ghRunner, MAX_PRS, REPO, type Runner } from './github.ts';
 import { statusText, Store, Watcher, watchPush, type Notice } from './watcher.ts';
 import { SUBSCRIBER, SUBSCRIBER_NOTICE_CHANNEL, type SubscriberNotice } from './subscribers.ts';
-import { liveState, NOTICE_CHANNEL, operatorText, STATE_CHANNEL, STATE_REQUEST_CHANNEL, type LiveNotice, type LiveState } from './live-state.ts';
+import { liveState, NOTICE_CHANNEL, STATE_CHANNEL, STATE_REQUEST_CHANNEL, type LiveNotice, type LiveState } from './live-state.ts';
 
 export const MESSAGE_TYPE = 'gitwatch';
 const actions = ['status', 'watch', 'unwatch'] as const;
@@ -81,8 +81,6 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
   let epoch = 0;
   let interactive = false;
   let warn: ((text: string) => void) | undefined;
-  /** Puts a line in front of the operator now, without a model turn. Only a session with a UI has one. */
-  let tell: ((text: string) => void) | undefined;
   /** The last state published, for a consumer that loads later and asks for it. */
   let lastState: LiveState | undefined;
   let stopRequests: (() => void) | undefined;
@@ -133,7 +131,7 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
     publish(NOTICE_CHANNEL, live);
   };
 
-  // A notice that needs the agent wakes it; an expected merge only waits for its next turn (no model call), but the operator sees it at once.
+  // A notice that needs the agent wakes it; an expected merge is appended to the session at once, visible to the operator and in the model's context, and starts no turn.
   const deliver = async (notice: Notice) => {
     if (notice.subscriber) {
       const claimed = claimForSubscriber(notice.subscriber, notice);
@@ -142,18 +140,15 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
     }
     const text = notice.subscriber ? `${notice.text}\n(For ${notice.subscriber}: no subscriber accepted it, so it is delivered here.)` : notice.text;
     let accepted = false;
-    // Pi holds a nextTurn message until the operator's next message: a quiet notice is told to him now through the UI, and its transcript copy is for the model only.
-    const told = !notice.wake && tell !== undefined;
     try {
+      // Never `deliverAs: 'nextTurn'` for a quiet notice: Pi keeps those in memory until the operator writes again (surviving a reload, with the display flag of the code that queued them) and only then renders them.
+      // `triggerTurn: false` appends the message now (after the current turn if one is running), with no model call.
       await pi.sendMessage(
-        { customType: MESSAGE_TYPE, content: text, display: !told, details: { repo: notice.repo, events: notice.events } },
-        notice.wake ? { triggerTurn: true, deliverAs: 'steer' } : { deliverAs: 'nextTurn' },
+        { customType: MESSAGE_TYPE, content: text, display: true, details: { repo: notice.repo, events: notice.events } },
+        notice.wake ? { triggerTurn: true, deliverAs: 'steer' } : { triggerTurn: false },
       );
       accepted = true;
     } catch { /* A rejected dispatch may have taken effect; record uncertainty without replaying it. */ }
-    if (told) {
-      try { tell!(operatorText(text)); } catch { /* the model copy was queued; a UI that cannot show it loses only the live line */ }
-    }
     if (accepted) publishNotice(notice);
     await watcher.recordDelivery(notice.wake, accepted);
     if (!accepted) warn?.('Gitwatch: notice delivery is uncertain. Inspect session activity before retrying; no automatic replay.');
@@ -200,7 +195,6 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
 
   pi.on('session_start', (_event, ctx) => {
     warn = ctx.hasUI ? text => ctx.ui.notify(text, 'warning') : undefined;
-    tell = ctx.hasUI ? text => ctx.ui.notify(text, 'info') : undefined;
     interactive = ctx.mode === 'tui';
     stopRequests ??= pi.events.on(STATE_REQUEST_CHANNEL, () => { if (lastState) publish(STATE_CHANNEL, lastState); });
     start();

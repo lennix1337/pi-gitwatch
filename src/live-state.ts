@@ -44,7 +44,3 @@ export function liveState(state: State, polledAt: number): LiveState {
   }));
   return { version: 1, polledAt, repos };
 }
-
-/** The footer that tells the agent how to treat a notice; the operator reading the same notice does not need it. */
-const AGENT_FOOTER = /\nAutomated watcher notice, not the operator's words:.*$/s;
-export const operatorText = (text: string) => text.replace(AGENT_FOOTER, '');
