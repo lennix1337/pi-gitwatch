@@ -6,8 +6,8 @@ import { gitRunner } from '../src/autowatch.ts';
 import { cleanupLines, fastForwardMain } from '../src/cleanup.ts';
 import { gitWorld as world, run } from './fixtures.ts';
 
-/** The folder spelled differently from what git prints (case on Windows, a trailing slash added by the caller). */
-const spelled = (p: string) => process.platform === 'win32' ? p.replaceAll('\\', '/').toUpperCase() : p;
+/** The folder spelled differently from what git prints: upper case where the filesystem ignores case (Windows), a trailing slash everywhere. */
+const spelled = (p: string) => `${process.platform === 'win32' ? p.toUpperCase() : p}/`;
 const norm = (p: string) => p.replaceAll('\\', '/').toLowerCase();
 
 const merged = (pr = 7, head = 'deadbeef') => ({ kind: 'merged', pr, head });
@@ -107,7 +107,7 @@ test('a main checkout on another branch or a detached HEAD is skipped with the r
 test('a loaded Pi package adds a `reload needed` line that is information, not left, compared by normalized path', async () => {
   const w = world();
   w.merge();
-  const lines = await cleanupLines(gitRunner, { clone: w.main, events: [merged()] }, { packages: [w.main.replaceAll('\\', '/').toUpperCase() + '/'] });
+  const lines = await cleanupLines(gitRunner, { clone: w.main, events: [merged()] }, { packages: [spelled(w.main)] });
   const reload = lines.find(l => l.text.startsWith('reload needed'));
   assert.ok(reload, lines.map(l => l.text).join('\n'));
   assert.equal(reload.left, undefined, 'it asks nothing of the agent by itself');

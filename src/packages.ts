@@ -1,16 +1,21 @@
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, resolve, win32 } from 'node:path';
 import { githubRepo, type GitRunner } from './autowatch.ts';
 
 const agentDir = () => process.env.PI_CODING_AGENT_DIR ?? join(homedir(), '.pi', 'agent');
 
-/** A path in one spelling: absolute, forward slashes, no trailing slash. */
-const absolute = (path: string, base: string) => resolve(base, path).replace(/\\/g, '/').replace(/\/+$/, '');
-/** The same, case-folded on Windows: the spelling two paths are compared in. */
+/** A Windows drive path (`C:/x`, `C:\x`): absolute on every OS, since the settings file may name Windows folders. */
+const DRIVE = /^[A-Za-z]:[\\/]/;
+
+/** A path in one spelling: absolute, forward slashes, no trailing slash. A drive path is never joined to `base`. */
+const absolute = (path: string, base: string) =>
+  (DRIVE.test(path) ? win32.normalize(path) : resolve(base, path)).replace(/\\/g, '/').replace(/\/+$/, '');
+
+/** The same, case-folded where the filesystem ignores case (Windows, drive paths): the spelling two paths are compared in. */
 export const normalizePath = (path: string, platform: string = process.platform) => {
   const full = absolute(path, '/');
-  return platform === 'win32' ? full.toLowerCase() : full;
+  return platform === 'win32' || DRIVE.test(path) ? full.toLowerCase() : full;
 };
 
 /** Sources that name a registry or URL, not a folder. */
