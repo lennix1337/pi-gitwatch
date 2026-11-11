@@ -25,7 +25,7 @@ export const REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 export const BRANCH = /^[A-Za-z0-9._\/-]{1,200}$/;
 
 const ROLLUP = `statusCheckRollup { contexts(first: ${CONTEXTS_PAGE}) { nodes { __typename
-  ... on CheckRun { name status conclusion detailsUrl } ... on StatusContext { context state targetUrl } } } }`;
+  ... on CheckRun { name status conclusion detailsUrl startedAt } ... on StatusContext { context state targetUrl createdAt } } } }`;
 const FIELDS = `number title url state isDraft mergeStateStatus reviewDecision headRefOid headRefName author { login } autoMergeRequest { enabledAt } mergeCommit { oid }
   commits(last: 1) { nodes { commit { ${ROLLUP} } } }
   baseRef { branchProtectionRule { requiredStatusCheckContexts }

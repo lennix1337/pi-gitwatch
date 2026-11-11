@@ -5,12 +5,12 @@ import { join } from 'node:path';
 import type { Runner } from '../src/github.ts';
 import type { RawCommit, RawPullRequest } from '../src/model.ts';
 
-export type Check = [name: string, status: string, conclusion?: string | null];
+export type Check = [name: string, status: string, conclusion?: string | null, startedAt?: string | null];
 export function pr(number: number, over: Partial<RawPullRequest> = {}, checks: Check[] = [['test', 'COMPLETED', 'SUCCESS']]): RawPullRequest {
   return {
     number, title: `PR ${number}`, url: `https://github.com/o/r/pull/${number}`, state: 'OPEN', isDraft: false, mergeStateStatus: 'BLOCKED',
     reviewDecision: null, headRefOid: `${number}`.padEnd(40, 'a'), author: { login: 'dev' }, autoMergeRequest: null, mergeCommit: null,
-    commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: checks.map(([name, status, conclusion]) => ({ __typename: 'CheckRun', name, status, conclusion: conclusion ?? null })) } } } }] },
+    commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: checks.map(([name, status, conclusion, startedAt]) => ({ __typename: 'CheckRun', name, status, conclusion: conclusion ?? null, ...startedAt ? { startedAt } : {} })) } } } }] },
     ...over,
   };
 }
@@ -19,7 +19,7 @@ export function pr(number: number, over: Partial<RawPullRequest> = {}, checks: C
 export function commit(oid: string, checks: Check[] = [['test', 'COMPLETED', 'SUCCESS']], run = 900): RawCommit {
   return {
     oid: oid.padEnd(40, '0'), messageHeadline: `commit ${oid}`,
-    statusCheckRollup: { contexts: { nodes: checks.map(([name, status, conclusion]) => ({ __typename: 'CheckRun', name, status, conclusion: conclusion ?? null, detailsUrl: `https://github.com/o/r/actions/runs/${run}/job/1` })) } },
+    statusCheckRollup: { contexts: { nodes: checks.map(([name, status, conclusion, startedAt]) => ({ __typename: 'CheckRun', name, status, conclusion: conclusion ?? null, ...startedAt ? { startedAt } : {}, detailsUrl: `https://github.com/o/r/actions/runs/${run}/job/1` })) } },
   };
 }
 

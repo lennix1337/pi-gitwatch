@@ -9,6 +9,8 @@ export interface Checks {
   runs: number[];
   /** The failing checks, one per name and link, in name order. */
   failedJobs: FailedJob[];
+  /** Ms epoch of the oldest still-running check, when GitHub gave a start time for one. */
+  pendingSince?: number;
 }
 /** The slots whose last announced value decides whether a repeated confirmation is news. */
 export type Slot = 'checks' | 'mergeState';
@@ -47,6 +49,8 @@ export interface WatchEvent {
 interface RawContext {
   __typename?: string; name?: string; status?: string; conclusion?: string | null; context?: string; state?: string;
   detailsUrl?: string | null; targetUrl?: string | null;
+  /** When a check run started, or a commit status was created: the clock of a check that is still running. */
+  startedAt?: string | null; createdAt?: string | null;
 }
 export interface RawCommit { oid: string; messageHeadline: string; statusCheckRollup: { contexts: { nodes: RawContext[] } } | null }
 export interface RawPullRequest {
@@ -109,6 +113,8 @@ export function summarizeChecks(contexts: RawContext[]): Checks {
   checks.failing.sort();
   checks.runs = failedRuns(contexts, checks.failing);
   checks.failedJobs = failedJobs(contexts, checks.failing);
+  const started = contexts.filter(c => verdict(c) === 'pending').map(c => Date.parse(c.startedAt ?? c.createdAt ?? '')).filter(Number.isFinite);
+  if (started.length) checks.pendingSince = Math.min(...started);
   checks.state = checks.pending > 0 ? 'pending' : checks.fail > 0 ? 'fail' : checks.pass > 0 ? 'pass' : 'none';
   return checks;
 }

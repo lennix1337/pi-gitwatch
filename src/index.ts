@@ -9,6 +9,7 @@ import { pendingFollows } from './follow-requests.ts';
 import { BRANCH, ghRunner, MAX_PRS, REPO, type Runner } from './github.ts';
 import { statusText, Store, Watcher, watchPush, type Notice } from './watcher.ts';
 import { SUBSCRIBER, SUBSCRIBER_NOTICE_CHANNEL, type SubscriberNotice } from './subscribers.ts';
+import { liveState, NOTICE_CHANNEL, operatorText, STATE_CHANNEL, STATE_REQUEST_CHANNEL, type LiveNotice, type LiveState } from './live-state.ts';
 
 export const MESSAGE_TYPE = 'gitwatch';
 const actions = ['status', 'watch', 'unwatch'] as const;
@@ -80,6 +81,11 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
   let epoch = 0;
   let interactive = false;
   let warn: ((text: string) => void) | undefined;
+  /** Puts a line in front of the operator now, without a model turn. Only a session with a UI has one. */
+  let tell: ((text: string) => void) | undefined;
+  /** The last state published, for a consumer that loads later and asks for it. */
+  let lastState: LiveState | undefined;
+  let stopRequests: (() => void) | undefined;
   let illegalMoveReported = false;
 
   /** The only place `loop` changes: a move the table does not list is ignored and reported once. */
@@ -112,22 +118,43 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
     return claim.accepted;
   };
 
-  // A notice that needs the agent wakes it; an expected merge only waits for its next turn (no model call).
+  /** One emit on the shared bus; a consumer that throws costs this session nothing. */
+  const publish = (channel: string, payload: unknown) => {
+    try { pi.events.emit(channel, payload); }
+    catch (error) { warn?.(`Gitwatch: a listener of ${channel} failed (${error instanceof Error ? error.message : String(error)}).`); }
+  };
+  /** What is followed, after a poll: read from the state that poll saved, so it costs no GitHub call. */
+  const publishState = () => {
+    lastState = liveState(watcher.state(), now());
+    publish(STATE_CHANNEL, lastState);
+  };
+  const publishNotice = (notice: Notice) => {
+    const live: LiveNotice = { repo: notice.repo, wake: notice.wake, text: notice.text, at: now(), events: notice.events, ...notice.subscriber ? { subscriber: notice.subscriber } : {} };
+    publish(NOTICE_CHANNEL, live);
+  };
+
+  // A notice that needs the agent wakes it; an expected merge only waits for its next turn (no model call), but the operator sees it at once.
   const deliver = async (notice: Notice) => {
     if (notice.subscriber) {
       const claimed = claimForSubscriber(notice.subscriber, notice);
       await watcher.recordSubscriber(claimed);
-      if (claimed) return;
+      if (claimed) { publishNotice(notice); return; }
     }
     const text = notice.subscriber ? `${notice.text}\n(For ${notice.subscriber}: no subscriber accepted it, so it is delivered here.)` : notice.text;
     let accepted = false;
+    // Pi holds a nextTurn message until the operator's next message: a quiet notice is told to him now through the UI, and its transcript copy is for the model only.
+    const told = !notice.wake && tell !== undefined;
     try {
       await pi.sendMessage(
-        { customType: MESSAGE_TYPE, content: text, display: true, details: { repo: notice.repo, events: notice.events } },
+        { customType: MESSAGE_TYPE, content: text, display: !told, details: { repo: notice.repo, events: notice.events } },
         notice.wake ? { triggerTurn: true, deliverAs: 'steer' } : { deliverAs: 'nextTurn' },
       );
       accepted = true;
     } catch { /* A rejected dispatch may have taken effect; record uncertainty without replaying it. */ }
+    if (told) {
+      try { tell!(operatorText(text)); } catch { /* the model copy was queued; a UI that cannot show it loses only the live line */ }
+    }
+    if (accepted) publishNotice(notice);
     await watcher.recordDelivery(notice.wake, accepted);
     if (!accepted) warn?.('Gitwatch: notice delivery is uncertain. Inspect session activity before retrying; no automatic replay.');
   };
@@ -154,6 +181,7 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
           }
         }
         const { notices } = await watcher.poll(undefined, undefined, { cleanup });
+        publishState();
         for (const n of notices) { if (mine !== epoch) break; await deliver(n); }
       }
     } catch { warn?.('Gitwatch: polling or local delivery evidence could not be completed. Inspect gitwatch status and local state before retrying.'); }
@@ -166,11 +194,15 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
     if (loop.phase === 'waiting') cancel(loop.timer);
     move({ phase: 'stopped' });
     lease.release();
+    stopRequests?.();
+    stopRequests = undefined;
   };
 
   pi.on('session_start', (_event, ctx) => {
     warn = ctx.hasUI ? text => ctx.ui.notify(text, 'warning') : undefined;
+    tell = ctx.hasUI ? text => ctx.ui.notify(text, 'info') : undefined;
     interactive = ctx.mode === 'tui';
+    stopRequests ??= pi.events.on(STATE_REQUEST_CHANNEL, () => { if (lastState) publish(STATE_CHANNEL, lastState); });
     start();
   });
   pi.on('session_shutdown', stop);
@@ -215,6 +247,7 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
         if (params.repo && !before.repos[params.repo]) return reply(statusText(before, new Map(), params.repo, now()));
         // Changes found by this refresh are shown here, so they are not announced again.
         const { events } = Object.keys(before.repos).length ? await watcher.poll(params.repo, signal, { deliver: false, cleanup }) : { events: new Map() };
+        if (Object.keys(before.repos).length) publishState();
         return reply(statusText(watcher.state(), events, params.repo, now()));
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
