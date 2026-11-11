@@ -9,6 +9,9 @@ import { Store } from '../src/watcher.ts';
 import { pendingFollows, requestFollow } from '../src/follow-requests.ts';
 import { commit, FakeGitHub, gitWorld, pr, run, tempDir } from './fixtures.ts';
 
+/** A quiet notice is appended to the session at once and starts no turn. A `nextTurn` message would be held until the operator's next message. */
+const QUIET = { triggerTurn: false };
+
 type Handler = (event: unknown, ctx: { mode: string; cwd?: string; hasUI?: boolean; ui?: { notify: (text: string, type?: string) => void } }) => unknown;
 /** `git` answers the extension's git calls (default: a fake of o/r on main); `packages` are the loaded Pi packages (default: none, never the real settings). */
 function harness(mode = 'tui', dir = tempDir(), send?: () => void | Promise<void>, over: { git?: GitRunner; packages?: string[] } = {}) {
@@ -248,7 +251,7 @@ test('a PR a script follows from a linked worktree is cleaned up, the main check
   h.gh.set(merged(33, s.head));
   await h.fire();
   assert.equal(h.sent.length, 1);
-  assert.deepEqual(h.sent[0].options, { deliverAs: 'nextTurn' });
+  assert.deepEqual(h.sent[0].options, QUIET);
   assert.match(h.sent[0].message.content, /#33 merged cf5d0032/);
   assert.match(h.sent[0].message.content, /removed worktree .*feat-x and branch feat\/x/);
   assert.match(h.sent[0].message.content, /fast-forwarded main in /);
@@ -279,7 +282,7 @@ test('a script that names no clone: the loaded Pi package of that repository is 
   h.gh.set(merged(35, s.head));
   await h.fire();
   assert.equal(h.sent.length, 1);
-  assert.deepEqual(h.sent[0].options, { deliverAs: 'nextTurn' }, 'a loaded package whose cleanup and fast-forward went fine needs no turn');
+  assert.deepEqual(h.sent[0].options, QUIET, 'a loaded package whose cleanup and fast-forward went fine needs no turn');
   assert.match(h.sent[0].message.content, /fast-forwarded main in /);
   assert.match(h.sent[0].message.content, /reload needed: .* is a loaded Pi package/);
   assert.equal(run(s.main, 'rev-parse', 'HEAD'), run(s.other, 'rev-parse', 'HEAD'));
@@ -405,22 +408,38 @@ const listen = <T>(h: { events: { on: (channel: string, fn: (data: unknown) => v
   return seen;
 };
 
-test('a quiet notice reaches the operator at once through the UI, and still waits as the model copy for the next turn', async () => {
+test('a quiet notice is in the session as soon as it happens, visible, with no turn and no held copy', async () => {
   const s = shipped();
   const h = harness('tui', tempDir(), undefined, { git: s.git, packages: [s.main] });
   h.gh.set(pr(37, { autoMergeRequest: {}, headRefOid: s.head.padEnd(40, '0') }, [['test', 'IN_PROGRESS']]));
   requestFollow(h.dir, { repo: 'o/r', pr: 37 });
   await h.fire();
-  assert.equal(h.shown.length, 0, 'a poll with nothing to report shows nothing');
+  assert.equal(h.sent.length, 0, 'a poll with nothing to report sends nothing');
   h.gh.set(merged(37, s.head));
   await h.fire();
-  assert.equal(h.sent.length, 1);
-  assert.deepEqual(h.sent[0].options, { deliverAs: 'nextTurn' }, 'the model copy still costs no turn');
-  assert.equal(h.shown.length, 1, 'the operator is told when it happens, not at his next message');
-  assert.equal(h.sent[0].message.display, false, 'the transcript does not repeat what the operator already saw');
-  assert.match(h.shown[0].text, /^\[gitwatch\] o\/r · \d\d:\d\d\n  since last notice: #37 merged cf5d0032/);
-  assert.doesNotMatch(h.shown[0].text, /Automated watcher notice/, 'the agent-only footer is not for the operator');
-  assert.equal(h.shown[0].sentBefore, 1, 'shown in the same delivery as the queued copy');
+  assert.equal(h.sent.length, 1, 'one message: the same one the operator sees and the model reads');
+  assert.deepEqual(h.sent[0].options, QUIET, 'Pi holds a nextTurn message until the operator writes again; this one is appended now');
+  assert.equal(h.sent[0].message.display, true);
+  assert.match(h.sent[0].message.content, /^\[gitwatch\] o\/r · \d\d:\d\d\n  since last notice: #37 merged cf5d0032/);
+  assert.equal(h.shown.length, 0, 'ctx.ui.notify is not used: Pi overwrites consecutive info lines, so only the last of several would stay');
+});
+
+test('several quiet notices over time are each a visible message of their own, none held for the next one', async () => {
+  const s = shipped();
+  const h = harness('tui', tempDir(), undefined, { git: s.git, packages: [s.main] });
+  for (const n of [60, 61, 62]) {
+    h.gh.set(pr(n, { autoMergeRequest: {}, headRefOid: s.head.padEnd(40, '0') }, [['test', 'IN_PROGRESS']]));
+    requestFollow(h.dir, { repo: 'o/r', pr: n });
+    await h.fire();
+    h.gh.set(merged(n, s.head));
+    await h.fire();
+  }
+  assert.deepEqual(h.sent.map(m => /#(6\d) merged/.exec(m.message.content)?.[1]), ['60', '61', '62']);
+  for (const m of h.sent) {
+    assert.deepEqual(m.options, QUIET);
+    assert.equal(m.message.display, true);
+  }
+  assert.equal(h.shown.length, 0);
 });
 
 test('a wake notice is not duplicated on the UI: its steer message already shows', async () => {
@@ -501,7 +520,7 @@ test('the request listener leaves with the session: a restarted extension answer
   assert.equal(states.length, 0);
 });
 
-test('a session without a UI keeps the quiet notice visible in the transcript', async () => {
+test('a session without a UI gets the same quiet message as one with a UI', async () => {
   const s = shipped();
   const h = harness('tui', tempDir(), undefined, { git: s.git, packages: [s.main] });
   h.handlers.get('session_start')!({}, { mode: 'tui', hasUI: false });
@@ -510,7 +529,7 @@ test('a session without a UI keeps the quiet notice visible in the transcript', 
   await h.fire();
   h.gh.set(merged(38, s.head));
   await h.fire();
-  assert.deepEqual(h.sent[0].options, { deliverAs: 'nextTurn' });
+  assert.deepEqual(h.sent[0].options, QUIET);
   assert.equal(h.sent[0].message.display, true);
   assert.equal(h.shown.length, 0);
 });

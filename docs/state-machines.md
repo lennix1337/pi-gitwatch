@@ -65,7 +65,7 @@ Severity: P1 wrong behaviour with real impact, P2 wrong behaviour in a reachable
 
 ## 8. Notice delivery and dedupe (`src/index.ts:94-107`, `recordDelivery`)
 
-- **Notice routing:** `wake` true -> `steer` with `triggerTurn`; false -> `nextTurn`. Outcome per notice: accepted or uncertain (rejected/thrown), counted in `deliveries`, never replayed.
+- **Notice routing:** `wake` true -> `steer` with `triggerTurn`; false -> `triggerTurn: false` (appended at once, no turn). Outcome per notice: accepted or uncertain (rejected/thrown), counted in `deliveries`, never replayed.
 - **Dedupe:** achieved by state, not by a sent-set: an event exists only on the transition that changed the snapshot, and the snapshot is saved in the same `poll` (`stallReported`, `reported`, pruning of merged PRs). `status` refresh consumes the same transitions, so it shows them and the loop never repeats them.
 - **Findings:** only GW-3 (delivery after the state advance), described under the poll loop.
 
