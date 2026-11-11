@@ -104,13 +104,13 @@ test('a main checkout on another branch or a detached HEAD is skipped with the r
   assert.notEqual(run(w.main, 'rev-parse', 'main'), run(w.other, 'rev-parse', 'HEAD'), 'main did not move');
 });
 
-test('a loaded Pi package adds a left `reload needed` line, compared by normalized path', async () => {
+test('a loaded Pi package adds a `reload needed` line that is information, not left, compared by normalized path', async () => {
   const w = world();
   w.merge();
   const lines = await cleanupLines(gitRunner, { clone: w.main, events: [merged()] }, { packages: [w.main.replaceAll('\\', '/').toUpperCase() + '/'] });
   const reload = lines.find(l => l.text.startsWith('reload needed'));
   assert.ok(reload, lines.map(l => l.text).join('\n'));
-  assert.equal(reload.left, true);
+  assert.equal(reload.left, undefined, 'it asks nothing of the agent by itself');
   const unrelated = await cleanupLines(gitRunner, { clone: w.main, events: [merged()] }, { packages: [join(w.root, 'elsewhere')] });
   assert.ok(unrelated.every(l => !l.text.startsWith('reload needed')));
 });

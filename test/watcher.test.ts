@@ -597,16 +597,30 @@ test('an auto-merge with nothing local to clean (branch already gone) is quiet t
   assert.deepEqual(notices.map(n => n.wake), [false]);
 });
 
-test('a merge wakes when cleanup or the fast-forward left something: kept branch, skipped fast-forward, reload needed', async () => {
+test('a merge wakes when cleanup or the fast-forward left something: kept branch, skipped fast-forward', async () => {
   for (const line of [
     { text: 'kept feat/x: contains modified or untracked files', left: true as const },
     { text: 'skipped fast-forward of /work/main: it has uncommitted changes', left: true as const },
-    { text: 'reload needed: /work/main is a loaded Pi package', left: true as const },
   ]) {
     const { notices } = await mergedAfterQueue([line]);
     assert.deepEqual(notices.map(n => n.wake), [true], line.text);
     assert.match(notices[0].text, new RegExp(line.text.split(':')[0]));
   }
+});
+
+test('a loaded Pi package whose cleanup and fast-forward went fine: the merge is quiet and the reload line rides along', async () => {
+  const { notices, watcher } = await mergedAfterQueue([{ text: 'removed branch feat/x' }, { text: 'fast-forwarded main in /work/main to abc1234 (1 commit)' }, { text: 'reload needed: /work/main is a loaded Pi package' }]);
+  assert.deepEqual(notices.map(n => n.wake), [false]);
+  assert.match(notices[0].text, /#90 merged abc12345/);
+  assert.match(notices[0].text, /reload needed: \/work\/main is a loaded Pi package(?! \(in)/);
+  assert.equal(watcher.state().routes?.candidate, 1);
+  assert.equal(watcher.state().routes?.respond, 0);
+});
+
+test('a loaded Pi package still wakes when its fast-forward was skipped, with the reload line in the same notice', async () => {
+  const { notices } = await mergedAfterQueue([{ text: 'skipped fast-forward of /work/main: it has uncommitted changes', left: true }, { text: 'reload needed: /work/main is a loaded Pi package' }]);
+  assert.deepEqual(notices.map(n => n.wake), [true]);
+  assert.match(notices[0].text, /skipped fast-forward[\s\S]*reload needed/);
 });
 
 test('a merge wakes when the cleanup itself fails', async () => {

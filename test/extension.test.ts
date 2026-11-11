@@ -268,7 +268,7 @@ test('the same merge wakes the agent when the main checkout is dirty, naming why
   assert.equal(readFileSync(join(s.main, 'a.txt'), 'utf8'), 'wip');
 });
 
-test('a script that names no clone: the loaded Pi package of that repository is the checkout (root cause of #270-#274 never being cleaned), and it asks for a reload', async () => {
+test('a script that names no clone: the loaded Pi package of that repository is the checkout (root cause of #270-#274 never being cleaned), and its merge is quiet, carrying the reload line', async () => {
   const s = shipped();
   const h = harness('tui', tempDir(), undefined, { git: s.git, packages: [s.main] });
   h.gh.set(pr(35, { autoMergeRequest: {}, headRefOid: s.head.padEnd(40, '0') }, [['test', 'IN_PROGRESS']]));
@@ -276,7 +276,8 @@ test('a script that names no clone: the loaded Pi package of that repository is 
   await h.fire();
   h.gh.set(merged(35, s.head));
   await h.fire();
-  assert.deepEqual(h.sent[0].options, { triggerTurn: true, deliverAs: 'steer' });
+  assert.equal(h.sent.length, 1);
+  assert.deepEqual(h.sent[0].options, { deliverAs: 'nextTurn' }, 'a loaded package whose cleanup and fast-forward went fine needs no turn');
   assert.match(h.sent[0].message.content, /fast-forwarded main in /);
   assert.match(h.sent[0].message.content, /reload needed: .* is a loaded Pi package/);
   assert.equal(run(s.main, 'rev-parse', 'HEAD'), run(s.other, 'rev-parse', 'HEAD'));
