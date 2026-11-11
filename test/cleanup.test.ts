@@ -48,27 +48,36 @@ test('long-lived branches are never removed, even at the merged head', async () 
   assert.match(git('branch', '--list', 'develop'), /develop/);
 });
 
-test('the cleanup lines name the PR and are empty without a clone or merged event', async () => {
+test('the cleanup lines name the PR and are empty without a clone or merged event; what stayed is marked left', async () => {
   const { dir, head } = repo();
   assert.deepEqual(await cleanupLines(gitRunner, { events: [{ kind: 'merged', pr: 3, head }] }), []);
   assert.deepEqual(await cleanupLines(gitRunner, { clone: dir, events: [{ kind: 'checks', pr: 3, head }] }), []);
   // Snapshots keep an 8-character head: git resolves the abbreviation.
   const lines = await cleanupLines(gitRunner, { clone: dir, events: [{ kind: 'merged', pr: 3, head: head.slice(0, 8) }] });
-  assert.deepEqual(lines.map(l => l.pr), [3, 3, 3]);
+  assert.deepEqual(lines.map(l => l.pr), [3, 3, 3, 3]);
   assert.match(lines[0].text, /^removed branch done$/);
+  assert.equal(lines[0].left, undefined);
   assert.match(lines[1].text, /^kept wt-dirty: .*untracked files/);
+  assert.equal(lines[1].left, true, 'a kept worktree is left for the agent');
   assert.match(lines[2].text, /^removed worktree .* and branch wt-done$/);
+  assert.match(lines[3].text, /^skipped fast-forward of .*: main has no upstream$/, 'this repository has no remote to update from');
 });
 
-test('a clone the agent already removed leaves no "spawn git ENOENT" note', async () => {
+test('a clone the agent already removed is one clear left line, not a "spawn git ENOENT" note', async () => {
   const { dir, head } = repo();
   const gone = join(dir, 'worktrees', 'already-removed');
-  assert.deepEqual(await cleanupLines(gitRunner, { clone: gone, events: [{ kind: 'merged', pr: 4, head }] }), []);
+  const lines = await cleanupLines(gitRunner, { clone: gone, events: [{ kind: 'merged', pr: 4, head }] });
+  assert.equal(lines.length, 1);
+  assert.match(lines[0].text, /^cleanup skipped: .* no longer exists/);
+  assert.equal(lines[0].left, true);
+  assert.doesNotMatch(lines[0].text, /ENOENT/);
 });
 
 test('a merged head this clone never fetched (a contributor PR) leaves no "malformed object name" note', async () => {
   const { dir } = repo();
-  assert.deepEqual(await cleanupLines(gitRunner, { clone: dir, events: [{ kind: 'merged', pr: 935, head: 'b2fff97d' }] }), []);
+  const lines = await cleanupLines(gitRunner, { clone: dir, events: [{ kind: 'merged', pr: 935, head: 'b2fff97d' }] });
+  assert.ok(lines.every(l => !/malformed|bad object|unknown revision/.test(l.text)), lines.map(l => l.text).join(', '));
+  assert.ok(lines.every(l => !l.text.startsWith('kept') && !l.text.startsWith('removed')), 'nothing local to clean for a head never fetched');
 });
 
 test('a worktree folder deleted by hand is pruned and its merged branch removed', async () => {

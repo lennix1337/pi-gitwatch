@@ -4,6 +4,7 @@ import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import { createdPrs, githubRepo, gitRunner, ownMerges, pushes, resolvePush, type GitRunner } from './autowatch.ts';
 import { cleanupLines } from './cleanup.ts';
+import { loadedPackages, packageClone } from './packages.ts';
 import { pendingFollows } from './follow-requests.ts';
 import { BRANCH, ghRunner, MAX_PRS, REPO, type Runner } from './github.ts';
 import { statusText, Store, Watcher, watchPush, type Notice } from './watcher.ts';
@@ -38,6 +39,8 @@ const LOOP_MOVES: Record<Loop['phase'], Loop['phase'][]> = { stopped: ['waiting'
 export interface Options {
   run?: Runner; git?: GitRunner; store?: Store; now?: () => number;
   schedule?: (fn: () => void, ms: number) => { unref?(): void } | unknown; cancel?: (handle: unknown) => void;
+  /** The folders of the loaded Pi packages; by default read from the Pi settings file at each use. */
+  packages?: () => string[];
 }
 
 /** Commands worth inspecting after they ran: a push or a PR creation. */
@@ -95,7 +98,8 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
   };
 
   /** Local cleanup of merged PRs: its lines are reported with the merge, in the same poll. */
-  const cleanup = (notice: { clone: string; events: Notice['events'] }) => cleanupLines(git, notice);
+  const packages = options.packages ?? (() => loadedPackages());
+  const cleanup = (notice: { clone: string; events: Notice['events'] }) => cleanupLines(git, notice, { packages: packages() });
 
   /**
    * A notice of a subscriber goes on the event bus first; a consumer that accepts it owns it. Otherwise (no consumer, or
@@ -136,7 +140,12 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
       const follows = pendingFollows(store.dir);
       if ((Object.keys(state.repos).length || follows.length) && lease.acquire(now(), interval * 3)) {
         for (const { request, done } of follows) {
-          try { await watcher.watch(request.repo, { prs: [request.pr] }); done(); }
+          try {
+            // A script that names no clone (older ship.mjs) still pushed from a checkout of the repository: a loaded Pi package is the one we can find.
+            const clone = request.clone ?? (watcher.state().repos[request.repo]?.clone ? undefined : await packageClone(request.repo, packages(), git));
+            await watcher.watch(request.repo, { prs: [request.pr], ...clone ? { clone } : {} });
+            done();
+          }
           catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             // A PR that is gone or already ended has nothing to follow; anything else (network) is retried next poll.
