@@ -196,3 +196,12 @@ test('a merge of a PR queued with auto-merge carries that fact; only then, and o
   assert.deepEqual(handledMerge(routeEvent(failed), failed, true), { route: 'respond', reason: 'wake' }, 'only merges are lowered');
   assert.equal(diff(normalize(pr(32, { autoMergeRequest: {} }, [['t', 'COMPLETED', 'SUCCESS']])), normalize(pr(32, { autoMergeRequest: {}, mergeStateStatus: 'CLEAN' }, [['t', 'COMPLETED', 'SUCCESS']]))).every(e => !e.wake), true, 'green checks with auto-merge never wake');
 });
+
+test('pendingSince is the start of the oldest running check; finished checks and unknown start times give none', () => {
+  const run = (name: string, status: string, startedAt?: string) => ({ ...ctx(name, status, status === 'COMPLETED' ? 'SUCCESS' : null), ...startedAt ? { startedAt } : {} });
+  const old = '2025-11-11T12:00:00Z', recent = '2025-11-11T12:30:00Z';
+  assert.equal(summarizeChecks([run('a', 'IN_PROGRESS', recent), run('b', 'QUEUED', old), run('c', 'COMPLETED', '2025-11-11T11:00:00Z')]).pendingSince, Date.parse(old));
+  assert.equal(summarizeChecks([{ __typename: 'StatusContext', context: 'ci', state: 'PENDING', createdAt: recent }]).pendingSince, Date.parse(recent));
+  assert.equal('pendingSince' in summarizeChecks([run('a', 'IN_PROGRESS')]), false, 'no start time known');
+  assert.equal('pendingSince' in summarizeChecks([run('a', 'COMPLETED', old)]), false, 'nothing running');
+});

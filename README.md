@@ -29,8 +29,18 @@ After a PR you pushed from this machine merges, its local branches that still po
 - One GraphQL request per repository per poll through the authenticated `gh` CLI; at most 50 PRs per repository.
 - Only an interactive (TUI) Pi polls, and a lease file keeps a single poller per machine; subagents and `pi -p` runs never poll.
 - Notices are custom messages (`customType: "gitwatch"`) sent with `triggerTurn` and `deliverAs: "steer"`.
+- A notice that does not wake the agent (a quiet merge, a held batch going out) is still shown to the operator at once as an `info` notification, without the agent-only footer; its model copy is queued with `deliverAs: "nextTurn"` and is not repeated in the transcript. A session without a UI shows it in the transcript instead.
 - Auto-follow: after a successful bash command with `gh pr create` or `git push` (tags, deletions and dry runs excluded; the command is split on `&&`, `||`, `;`, `|` and newlines outside quotes, and `~`/`$HOME` in a `cd` resolve to the home folder), the polling session follows the created PR, the pushed branch's open PR, or the pushed commit's CI, and appends `[gitwatch] now following ...` to the command output.
 - Read-only on GitHub. State: `~/.pi/agent/gitwatch/state.json` (override with `PI_GITWATCH_DIR`).
+
+## Live state for other extensions
+
+Stable contract on `pi.events` (in-process; a field may be added, never renamed; a breaking change gets a `:v2` channel). The interactive session that polls emits:
+
+- `gitwatch:state:v1`, after every poll or status refresh, built from data the poll already fetched (no extra `gh` call): `{ version: 1, polledAt, repos: [{ repo, mode: "open" | "list", lastError?, prs: [{ repo, number, title, url, head /* 7 chars */, mergeState, autoMerge, checks: { pass, fail, pending }, pendingSince /* ms epoch of the oldest running check, null if none or unknown */, next /* the notice's "next:" step, or null */ }], branches: [{ repo, branch, head, checks, pendingSince }] }] }`. Merged and closed PRs are gone from the list once reported.
+- `gitwatch:notice:v1`, for each delivered notice: `{ repo, wake, text, at, events, subscriber? }`.
+
+A consumer that loads later emits `gitwatch:state:request:v1`; the answer is the last `gitwatch:state:v1` again (nothing before the first poll).
 
 ## Delivery evidence
 

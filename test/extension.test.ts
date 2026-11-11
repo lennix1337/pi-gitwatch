@@ -9,20 +9,22 @@ import { Store } from '../src/watcher.ts';
 import { pendingFollows, requestFollow } from '../src/follow-requests.ts';
 import { commit, FakeGitHub, gitWorld, pr, run, tempDir } from './fixtures.ts';
 
-type Handler = (event: unknown, ctx: { mode: string; cwd?: string; hasUI?: boolean; ui?: { notify: (text: string) => void } }) => unknown;
+type Handler = (event: unknown, ctx: { mode: string; cwd?: string; hasUI?: boolean; ui?: { notify: (text: string, type?: string) => void } }) => unknown;
 /** `git` answers the extension's git calls (default: a fake of o/r on main); `packages` are the loaded Pi packages (default: none, never the real settings). */
 function harness(mode = 'tui', dir = tempDir(), send?: () => void | Promise<void>, over: { git?: GitRunner; packages?: string[] } = {}) {
   const gh = new FakeGitHub();
   const handlers = new Map<string, Handler>();
-  const sent: { message: { customType: string; content: string }; options: unknown }[] = [];
+  const sent: { message: { customType: string; content: string; display?: boolean }; options: unknown }[] = [];
   const timers: (() => void)[] = [];
   const warnings: string[] = [];
+  /** What the operator sees at once (ctx.ui.notify at 'info' level), in order with `sent`. */
+  const shown: { text: string; sentBefore: number }[] = [];
   let tool: { execute: (...a: unknown[]) => Promise<{ content: { text: string }[]; isError?: boolean }> } | undefined;
   // The shared extension bus: a subscriber listens on a channel and may take a notice it is addressed to.
   const bus = new Map<string, ((data: unknown) => void)[]>();
   const events = {
     emit: (channel: string, data: unknown) => { for (const h of bus.get(channel) ?? []) h(data); },
-    on: (channel: string, h: (data: unknown) => void) => { bus.set(channel, [...bus.get(channel) ?? [], h]); return () => {}; },
+    on: (channel: string, h: (data: unknown) => void) => { bus.set(channel, [...bus.get(channel) ?? [], h]); return () => { bus.set(channel, (bus.get(channel) ?? []).filter(x => x !== h)); }; },
   };
   const pi = {
     on: (name: string, h: Handler) => handlers.set(name, h),
@@ -31,11 +33,11 @@ function harness(mode = 'tui', dir = tempDir(), send?: () => void | Promise<void
     events,
   };
   extension(pi as never, { run: gh.run, git: over.git ?? (async args => args[0] === 'remote' ? 'https://github.com/o/r.git' : 'main'), packages: () => over.packages ?? [], store: new Store(dir), schedule: fn => { timers.push(fn); return timers.length; }, cancel: () => {} });
-  handlers.get('session_start')!({}, { mode, hasUI: true, ui: { notify: text => warnings.push(text) } });
+  handlers.get('session_start')!({}, { mode, hasUI: true, ui: { notify: (text, type) => { if (type === 'info') shown.push({ text, sentBefore: sent.length }); else warnings.push(text); } } });
   const call = (params: Record<string, unknown>) => tool!.execute('id', params, undefined, undefined, {});
   /** Runs the scheduled poll and waits for it to settle. */
   const fire = async () => { const fn = timers.shift(); assert.ok(fn, 'a poll is scheduled'); await fn(); };
-  return { gh, sent, timers, call, fire, handlers, dir, warnings, events };
+  return { gh, sent, timers, call, fire, handlers, dir, warnings, events, shown };
 }
 
 test('a watched PR whose checks finish wakes the session with a steer message', async () => {
@@ -394,4 +396,121 @@ test('a merge this session makes with gh pr merge is recorded from bash: its own
   assert.equal(h.sent.length, 1);
   assert.match(h.sent[0].message.content, /#101 merged bbbb0011/);
   assert.doesNotMatch(h.sent[0].message.content, /#100/);
+});
+
+/** Every payload a channel carried, in order. */
+const listen = <T>(h: { events: { on: (channel: string, fn: (data: unknown) => void) => unknown } }, channel: string) => {
+  const seen: T[] = [];
+  h.events.on(channel, data => seen.push(data as T));
+  return seen;
+};
+
+test('a quiet notice reaches the operator at once through the UI, and still waits as the model copy for the next turn', async () => {
+  const s = shipped();
+  const h = harness('tui', tempDir(), undefined, { git: s.git, packages: [s.main] });
+  h.gh.set(pr(37, { autoMergeRequest: {}, headRefOid: s.head.padEnd(40, '0') }, [['test', 'IN_PROGRESS']]));
+  requestFollow(h.dir, { repo: 'o/r', pr: 37 });
+  await h.fire();
+  assert.equal(h.shown.length, 0, 'a poll with nothing to report shows nothing');
+  h.gh.set(merged(37, s.head));
+  await h.fire();
+  assert.equal(h.sent.length, 1);
+  assert.deepEqual(h.sent[0].options, { deliverAs: 'nextTurn' }, 'the model copy still costs no turn');
+  assert.equal(h.shown.length, 1, 'the operator is told when it happens, not at his next message');
+  assert.equal(h.sent[0].message.display, false, 'the transcript does not repeat what the operator already saw');
+  assert.match(h.shown[0].text, /^\[gitwatch\] o\/r · \d\d:\d\d\n  since last notice: #37 merged cf5d0032/);
+  assert.doesNotMatch(h.shown[0].text, /Automated watcher notice/, 'the agent-only footer is not for the operator');
+  assert.equal(h.shown[0].sentBefore, 1, 'shown in the same delivery as the queued copy');
+});
+
+test('a wake notice is not duplicated on the UI: its steer message already shows', async () => {
+  const h = harness();
+  h.gh.set(pr(750, {}, [['test', 'IN_PROGRESS']]));
+  await h.call({ action: 'watch', repo: 'o/r', prs: [750] });
+  h.gh.set(pr(750, { mergeStateStatus: 'CLEAN' }));
+  await h.fire();
+  assert.deepEqual(h.sent[0].options, { triggerTurn: true, deliverAs: 'steer' });
+  assert.equal(h.shown.length, 0);
+});
+
+test('every poll publishes gitwatch:state:v1: a pending, a failing and a clean PR, and a branch, with the data already fetched', async () => {
+  const h = harness();
+  const states = listen<Record<string, unknown>>(h, 'gitwatch:state:v1');
+  const started = '2025-11-11T12:00:00Z', later = '2025-11-11T12:05:00Z';
+  h.gh.set(
+    pr(1, { title: 'pending one', headRefOid: 'abcdef0123'.padEnd(40, '0') }, [['build', 'IN_PROGRESS', null, later], ['lint', 'IN_PROGRESS', null, started], ['unit', 'COMPLETED', 'SUCCESS']]),
+    pr(2, { title: 'failing one', url: 'https://github.com/o/r/pull/2', mergeStateStatus: 'UNSTABLE' }, [['test', 'COMPLETED', 'FAILURE']]),
+    pr(3, { title: 'clean one', mergeStateStatus: 'CLEAN', autoMergeRequest: { enabledAt: 'x' } }, [['test', 'COMPLETED', 'SUCCESS']]),
+  );
+  h.gh.branches.set('main', commit('9999999abc', [['ci', 'IN_PROGRESS', null, started]]));
+  await h.call({ action: 'watch', repo: 'o/r' });
+  await h.call({ action: 'watch', repo: 'o/r', branch: 'main' });
+  states.length = 0;
+  const callsBefore = h.gh.calls.length;
+  await h.fire();
+  assert.equal(h.gh.calls.length - callsBefore, 1, 'publishing adds no GitHub call');
+  assert.equal(states.length, 1);
+  const [state] = states;
+  assert.equal(state.version, 1);
+  assert.equal(typeof state.polledAt, 'number');
+  assert.deepEqual(state.repos, [{
+    repo: 'o/r', mode: 'open',
+    prs: [
+      { repo: 'o/r', number: 1, title: 'pending one', url: 'https://github.com/o/r/pull/1', head: 'abcdef0', mergeState: 'BLOCKED', autoMerge: false, checks: { pass: 1, fail: 0, pending: 2 }, pendingSince: Date.parse(started), next: null },
+      { repo: 'o/r', number: 2, title: 'failing one', url: 'https://github.com/o/r/pull/2', head: '2aaaaaa', mergeState: 'UNSTABLE', autoMerge: false, checks: { pass: 0, fail: 1, pending: 0 }, pendingSince: null, next: 'read the failing job log: gh pr checks 2 --repo o/r' },
+      { repo: 'o/r', number: 3, title: 'clean one', url: 'https://github.com/o/r/pull/3', head: '3aaaaaa', mergeState: 'CLEAN', autoMerge: true, checks: { pass: 1, fail: 0, pending: 0 }, pendingSince: null, next: null },
+    ],
+    branches: [{ repo: 'o/r', branch: 'main', head: '9999999', checks: { pass: 0, fail: 0, pending: 1 }, pendingSince: Date.parse(started) }],
+  }]);
+});
+
+test('gitwatch:notice:v1 carries each delivered notice; a state request re-emits the last state for a late consumer', async () => {
+  const h = harness();
+  const notices = listen<Record<string, unknown>>(h, 'gitwatch:notice:v1');
+  const states = listen<Record<string, unknown>>(h, 'gitwatch:state:v1');
+  h.gh.set(pr(750, {}, [['test', 'IN_PROGRESS']]));
+  await h.call({ action: 'watch', repo: 'o/r', prs: [750] });
+  h.events.emit('gitwatch:state:request:v1', {});
+  assert.equal(states.length, 0, 'nothing was polled yet: nothing to re-emit');
+  h.gh.set(pr(750, { mergeStateStatus: 'CLEAN' }));
+  await h.fire();
+  assert.equal(notices.length, 1);
+  assert.equal(notices[0].repo, 'o/r');
+  assert.equal(notices[0].wake, true);
+  assert.match(String(notices[0].text), /#750 checks passed/);
+  assert.equal(typeof notices[0].at, 'number');
+  assert.deepEqual(notices[0].events, [{ pr: 750, kind: 'checks', text: 'checks passed 1/1', wake: true }, { pr: 750, kind: 'mergeState', text: 'mergeable (CLEAN)', wake: true }]);
+  assert.equal(states.length, 1);
+  const last = states[0];
+  const calls = h.gh.calls.length;
+  h.events.emit('gitwatch:state:request:v1', {});
+  assert.equal(states.length, 2, 'the request re-emits');
+  assert.deepEqual(states[1], last);
+  assert.equal(h.gh.calls.length, calls, 're-emitting asks GitHub nothing');
+});
+
+test('the request listener leaves with the session: a restarted extension answers once', async () => {
+  const h = harness();
+  const states = listen<unknown>(h, 'gitwatch:state:v1');
+  h.gh.set(pr(1, {}, [['test', 'IN_PROGRESS']]));
+  await h.call({ action: 'watch', repo: 'o/r', prs: [1] });
+  await h.fire();
+  states.length = 0;
+  h.handlers.get('session_shutdown')!({}, { mode: 'tui' });
+  h.events.emit('gitwatch:state:request:v1', {});
+  assert.equal(states.length, 0);
+});
+
+test('a session without a UI keeps the quiet notice visible in the transcript', async () => {
+  const s = shipped();
+  const h = harness('tui', tempDir(), undefined, { git: s.git, packages: [s.main] });
+  h.handlers.get('session_start')!({}, { mode: 'tui', hasUI: false });
+  h.gh.set(pr(38, { autoMergeRequest: {}, headRefOid: s.head.padEnd(40, '0') }, [['test', 'IN_PROGRESS']]));
+  requestFollow(h.dir, { repo: 'o/r', pr: 38 });
+  await h.fire();
+  h.gh.set(merged(38, s.head));
+  await h.fire();
+  assert.deepEqual(h.sent[0].options, { deliverAs: 'nextTurn' });
+  assert.equal(h.sent[0].message.display, true);
+  assert.equal(h.shown.length, 0);
 });
