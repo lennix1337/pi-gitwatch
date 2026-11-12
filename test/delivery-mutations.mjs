@@ -42,4 +42,4 @@ try {
   }
   baseline();
   console.log('3 mutants caught; clean and restored copies passed; original source unchanged.');
-} finally { rmSync(dir, { recursive: true, force: true }); }
+} finally { rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); }
