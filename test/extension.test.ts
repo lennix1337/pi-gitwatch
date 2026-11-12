@@ -288,6 +288,23 @@ test('a script that names no clone: the loaded Pi package of that repository is 
   assert.equal(run(s.main, 'rev-parse', 'HEAD'), run(s.other, 'rev-parse', 'HEAD'));
 });
 
+test('the same merge is quiet when the main checkout sits on another branch with its own work: no fast-forward, a reload note, no turn', async () => {
+  const s = shipped();
+  run(s.main, 'checkout', '-q', '-b', 'feat/y');
+  writeFileSync(join(s.main, 'y.txt'), 'other work'); run(s.main, 'add', '.'); run(s.main, 'commit', '-qm', 'y');
+  const h = harness('tui', tempDir(), undefined, { git: s.git, packages: [s.main] });
+  h.gh.set(pr(37, { autoMergeRequest: {}, headRefOid: s.head.padEnd(40, '0') }, [['test', 'IN_PROGRESS']]));
+  requestFollow(h.dir, { repo: 'o/r', pr: 37, clone: s.linked });
+  await h.fire();
+  h.gh.set(merged(37, s.head));
+  await h.fire();
+  assert.equal(h.sent.length, 1);
+  assert.deepEqual(h.sent[0].options, QUIET);
+  assert.match(h.sent[0].message.content, /skipped fast-forward of .*: it is on feat\/y, not main/);
+  assert.match(h.sent[0].message.content, /reload needed: /);
+  assert.equal(run(s.main, 'branch', '--show-current'), 'feat/y');
+});
+
 test('a script that names no clone for a repository that is not a loaded package: no cleanup is possible, so the merge wakes', async () => {
   const h = harness('tui', tempDir(), undefined, { packages: [tempDir()] });
   h.gh.set(pr(36, { autoMergeRequest: {} }, [['test', 'IN_PROGRESS']]));

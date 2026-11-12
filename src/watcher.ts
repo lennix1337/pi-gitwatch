@@ -552,7 +552,7 @@ async function cleanupEvents(watch: RepoWatch, routed: Routed[], cleanup?: PollO
   const lines = await cleanup({ clone, events: merged });
   const left = new Set(lines.filter(l => l.left).map(l => l.pr));
   // Fast-forward and reload lines already name their folder; the others are about the clone the push came from.
-  const events = lines.map(l => ({ pr: l.pr, kind: 'cleanup' as const, text: /^(reload needed|fast-forwarded|skipped fast-forward)/.test(l.text) ? l.text : `${l.text} (in ${clone})`, wake: false }));
+  const events = lines.map(l => ({ pr: l.pr, kind: 'cleanup' as const, text: /^(reload needed|fast-forwarded|skipped fast-forward|switched)/.test(l.text) ? l.text : `${l.text} (in ${clone})`, wake: false }));
   return { events, settled: new Set(merged.map(e => e.pr).filter(pr => !left.has(pr))) };
 }
 

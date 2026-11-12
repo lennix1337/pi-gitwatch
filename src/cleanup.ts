@@ -8,6 +8,9 @@ const PROTECTED = new Set(['main', 'master', 'trunk', 'develop']);
 /** The last line of a failure: execFile puts git's stderr after a "Command failed" line, and its last line names the reason. */
 const lastLine = (error: unknown) => String((error as Error).message ?? error).split(/\r?\n/).filter(l => l.trim()).pop();
 
+/** A branch kept because the main worktree has it checked out, or its worktree holds uncommitted work: the agent's own state, not a failure. */
+const STAYS_QUIET = /^kept [^:]+: (checked out in |.*contains modified or untracked files)/;
+
 interface Worktree { path: string; branch?: string; main: boolean }
 
 /** `git worktree list --porcelain`: blocks of `worktree <path>`, `HEAD <sha>`, `branch refs/heads/<name>`; the first is the main one. */
@@ -53,7 +56,10 @@ export async function cleanMerged(git: GitRunner, clone: string, head: string): 
   return lines;
 }
 
-/** One local cleanup result, tied to the PR whose merge caused it. `left`: something stayed for the agent to do. */
+/**
+ * One local cleanup result, tied to the PR whose merge caused it. `left`: something stayed that only the agent can
+ * fix, so the merge is worth a turn. A line without it is information the notice carries to the next turn.
+ */
 export interface CleanupLine { pr: number; text: string; left?: true }
 
 /** The branch the repository's default is, from `origin/HEAD`, else the usual names; `main` and `master` only as a fallback. */
@@ -73,7 +79,8 @@ export async function fastForwardMain(git: GitRunner, main: string): Promise<{ t
     const branch = await git(['symbolic-ref', '--short', 'HEAD'], main).catch(() => '');
     if (!branch) return skip('HEAD is detached');
     const defaults = await defaultBranch(git, main);
-    if (!defaults.includes(branch)) return skip(`it is on ${branch}, not ${defaults.join('/')}`);
+    // The agent's own work on another branch is not a failure: nothing here is waiting for it.
+    if (!defaults.includes(branch)) return { text: `skipped fast-forward of ${main}: it is on ${branch}, not ${defaults.join('/')}` };
     if (await git(['status', '--porcelain', '--untracked-files=no'], main)) return skip('it has uncommitted changes');
     const upstream = await git(['rev-parse', '--abbrev-ref', `${branch}@{upstream}`], main).catch(() => '');
     if (!upstream) return skip(`${branch} has no upstream`);
@@ -84,6 +91,37 @@ export async function fastForwardMain(git: GitRunner, main: string): Promise<{ t
     await git(['merge', '--ff-only', '--quiet', upstream], main);
     return { text: `fast-forwarded ${branch} in ${main} to ${await git(['rev-parse', '--short', 'HEAD'], main)} (${behind} commit${behind === 1 ? '' : 's'})` };
   } catch (error) { return skip(lastLine(error) ?? 'git failed'); }
+}
+
+/**
+ * A main checkout left on a feature branch whose work is already in the default branch of origin is moved back to that
+ * branch (so the fast-forward that follows can run) and the merged branch is removed. "Already in" is proven by the
+ * branch tip being the head of a PR merged in this poll, or by every one of its commits having a patch-equivalent
+ * commit in origin's default branch (`git cherry`, which sees a squash of one commit) and at least one existing: a
+ * branch created a moment ago, with no commit of its own, is somebody's next work. Never with uncommitted changes to
+ * tracked files, never when anything is unclear; the fast-forward then reports why it did not run. Returns the lines
+ * to report, or undefined when nothing was done.
+ */
+export async function switchMergedBranch(git: GitRunner, main: string, heads: string[]): Promise<string[] | undefined> {
+  try {
+    const branch = await git(['symbolic-ref', '--short', 'HEAD'], main).catch(() => '');
+    const defaults = await defaultBranch(git, main);
+    const target = defaults[0];
+    if (!branch || PROTECTED.has(branch) || defaults.includes(branch)) return undefined;
+    if (await git(['status', '--porcelain', '--untracked-files=no'], main)) return undefined;
+    const upstream = await git(['rev-parse', '--abbrev-ref', `${target}@{upstream}`], main).catch(() => '');
+    if (!upstream) return undefined;
+    await git(['fetch', '--quiet', upstream.slice(0, upstream.indexOf('/'))], main);
+    const tip = await git(['rev-parse', branch], main);
+    const resolved = await Promise.all(heads.map(h => git(['rev-parse', '--verify', '--quiet', `${h}^{commit}`], main).catch(() => '')));
+    if (!resolved.includes(tip)) {
+      const marks = (await git(['cherry', upstream, branch], main)).split(/\r?\n/).map(l => l.trim()[0]).filter(Boolean);
+      if (!marks.length || marks.includes('+')) return undefined;
+    }
+    await git(['checkout', '--quiet', target], main);
+    await git(['branch', '-D', branch], main);
+    return [`switched ${main} from ${branch} to ${target}: its commits are in ${upstream}`, `removed branch ${branch}`];
+  } catch { return undefined; }
 }
 
 /** Folders of the Pi packages the settings load: a merge into one of them is not live until Pi reloads. */
@@ -104,13 +142,15 @@ export async function cleanupLines(git: GitRunner, notice: { clone?: string; eve
   // Found first: removing a merged linked worktree may delete the folder this clone names.
   const main = await mainCheckout(git, notice.clone);
   const lines: CleanupLine[] = [];
+  // One checkout-level result per poll is filed under the last merged PR, as the fast-forward is.
+  const pr = merged[merged.length - 1].pr;
+  for (const text of await switchMergedBranch(git, main, merged.map(e => e.head!)) ?? []) lines.push({ pr, text });
   for (const e of merged) {
     try {
-      for (const text of await cleanMerged(git, notice.clone, e.head!)) lines.push({ pr: e.pr, text, ...text.startsWith('removed ') ? {} : { left: true as const } });
+      for (const text of await cleanMerged(git, notice.clone, e.head!)) lines.push({ pr: e.pr, text, ...text.startsWith('removed ') || STAYS_QUIET.test(text) ? {} : { left: true as const } });
     } catch (error) { lines.push({ pr: e.pr, text: `cleanup skipped: ${lastLine(error)}`, left: true }); }
   }
   // The checkout to update and to reload is the main one, whichever linked worktree the push came from.
-  const pr = merged[merged.length - 1].pr;
   const forward = await fastForwardMain(git, main);
   if (forward) lines.push({ pr, ...forward });
   if (isLoadedPackage(main, options.packages ?? [])) lines.push({ pr, text: `reload needed: ${main} is a loaded Pi package` });
