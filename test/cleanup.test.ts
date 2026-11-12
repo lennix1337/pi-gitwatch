@@ -48,7 +48,7 @@ test('long-lived branches are never removed, even at the merged head', async () 
   assert.match(git('branch', '--list', 'develop'), /develop/);
 });
 
-test('the cleanup lines name the PR and are empty without a clone or merged event; what stayed is marked left', async () => {
+test('the cleanup lines name the PR and are empty without a clone or merged event; a failure that needs the agent is marked left', async () => {
   const { dir, head } = repo();
   assert.deepEqual(await cleanupLines(gitRunner, { events: [{ kind: 'merged', pr: 3, head }] }), []);
   assert.deepEqual(await cleanupLines(gitRunner, { clone: dir, events: [{ kind: 'checks', pr: 3, head }] }), []);
@@ -58,9 +58,28 @@ test('the cleanup lines name the PR and are empty without a clone or merged even
   assert.match(lines[0].text, /^removed branch done$/);
   assert.equal(lines[0].left, undefined);
   assert.match(lines[1].text, /^kept wt-dirty: .*untracked files/);
-  assert.equal(lines[1].left, true, 'a kept worktree is left for the agent');
+  assert.equal(lines[1].left, undefined, 'a kept worktree with uncommitted files is only reported: the notice lists it, no turn is needed');
   assert.match(lines[2].text, /^removed worktree .* and branch wt-done$/);
   assert.match(lines[3].text, /^skipped fast-forward of .*: main has no upstream$/, 'this repository has no remote to update from');
+});
+
+test('a branch that cannot be deleted for another reason than a checkout or a dirty worktree is left for the agent', async () => {
+  const { dir, head, git } = repo();
+  git('checkout', '-q', 'main');
+  const failing = (args: string[], cwd: string) => args[0] === 'branch' && args[1] === '-D' ? Promise.reject(new Error('Command failed: git branch\nerror: cannot lock ref')) : gitRunner(args, cwd);
+  const lines = await cleanupLines(failing, { clone: dir, events: [{ kind: 'merged', pr: 3, head: head.slice(0, 8) }] });
+  const kept = lines.find(l => l.text.startsWith('kept done:'));
+  assert.ok(kept, lines.map(l => l.text).join(', '));
+  assert.equal(kept.left, true);
+});
+
+test('a branch checked out in the main worktree is only reported: the notice lists it, no turn is needed', async () => {
+  const { dir, head, git } = repo();
+  git('checkout', '-q', 'done');
+  const lines = await cleanupLines(gitRunner, { clone: dir, events: [{ kind: 'merged', pr: 3, head }] });
+  const kept = lines.find(l => l.text.startsWith('kept done: checked out in'));
+  assert.ok(kept, lines.map(l => l.text).join(', '));
+  assert.equal(kept.left, undefined);
 });
 
 test('a clone the agent already removed is one clear left line, not a "spawn git ENOENT" note', async () => {

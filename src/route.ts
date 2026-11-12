@@ -44,7 +44,9 @@ export function routeEvent(e: WatchEvent, ctx: { ownMerge?: boolean; cur?: Snaps
 /**
  * A merge that waited in the queue of this session (auto-merge) and whose local cleanup left nothing for the agent is
  * only reported: it becomes a candidate that is flushed at once without a turn. `settled` is false when no cleanup ran
- * (no known clone) or any of its lines says something stayed behind (kept branch, skipped fast-forward, reload).
+ * (no known clone) or any of its lines is marked `left` (something only the agent can fix: uncommitted changes or a
+ * divergence blocking the fast-forward, a failed cleanup). Information lines (reload needed, clone on another branch,
+ * kept branch) do not unsettle it: the notice lists them for the next turn.
  */
 export function handledMerge(decision: Decision, e: WatchEvent, settled: boolean): Decision {
   return decision.route === 'respond' && e.kind === 'merged' && e.auto === true && settled ? { route: 'candidate', reason: 'handled' } : decision;

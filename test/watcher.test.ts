@@ -2,10 +2,12 @@ import assert from 'node:assert/strict';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { gitRunner } from '../src/autowatch.ts';
+import { cleanupLines } from '../src/cleanup.ts';
 import { type Runner, query } from '../src/github.ts';
 import type { RawPullRequest } from '../src/model.ts';
 import { FAILURES_BEFORE_NOTICE, statusText, Store, Watcher, watchPush } from '../src/watcher.ts';
-import { commit, FakeGitHub, pr, tempDir } from './fixtures.ts';
+import { commit, FakeGitHub, gitWorld, pr, run, tempDir } from './fixtures.ts';
 
 const setup = () => {
   const gh = new FakeGitHub();
@@ -597,15 +599,72 @@ test('an auto-merge with nothing local to clean (branch already gone) is quiet t
   assert.deepEqual(notices.map(n => n.wake), [false]);
 });
 
-test('a merge wakes when cleanup or the fast-forward left something: kept branch, skipped fast-forward', async () => {
-  for (const line of [
-    { text: 'kept feat/x: contains modified or untracked files', left: true as const },
-    { text: 'skipped fast-forward of /work/main: it has uncommitted changes', left: true as const },
-  ]) {
-    const { notices } = await mergedAfterQueue([line]);
-    assert.deepEqual(notices.map(n => n.wake), [true], line.text);
-    assert.match(notices[0].text, new RegExp(line.text.split(':')[0]));
-  }
+test('a merge wakes when the cleanup left something only the agent can fix: uncommitted changes blocked the fast-forward', async () => {
+  const line = { text: 'skipped fast-forward of /work/main: it has uncommitted changes', left: true as const };
+  const { notices } = await mergedAfterQueue([line]);
+  assert.deepEqual(notices.map(n => n.wake), [true]);
+  assert.match(notices[0].text, /skipped fast-forward of \/work\/main/);
+});
+
+/** An auto-merge of PR 90 followed from `clone` of a real repository, cleaned by the real `cleanupLines`; `packages` are the loaded Pi packages. */
+async function mergedWithRealCleanup(clone: string, over: { auto?: boolean; packages?: string[]; head?: string } = {}) {
+  const { gh, watcher, tick } = setup();
+  gh.set(pr(90, { ...over.auto === false ? {} : { autoMergeRequest: {} }, headRefOid: (over.head ?? 'deadbeef').padEnd(40, '0') }, [['test', 'IN_PROGRESS']]));
+  await watcher.watch('o/r', { prs: [90], clone });
+  gh.set(pr(90, { state: 'MERGED', headRefOid: (over.head ?? 'deadbeef').padEnd(40, '0'), mergeCommit: { oid: 'abc12345ffff' } })); tick();
+  const { notices } = await watcher.poll(undefined, undefined, { cleanup: notice => cleanupLines(gitRunner, notice, { packages: over.packages }) });
+  return { notices, watcher };
+}
+/** The main checkout is on `feat/x` with a commit that is not on origin/main, and origin/main moved on (the merge). */
+function checkoutOnAnotherBranch() {
+  const w = gitWorld();
+  run(w.main, 'checkout', '-q', '-b', 'feat/x');
+  writeFileSync(join(w.main, 'wip.txt'), 'unmerged work'); run(w.main, 'add', '.'); run(w.main, 'commit', '-qm', 'wip');
+  w.merge();
+  return w;
+}
+
+test('an auto-merge whose only leftover is a clone on another branch is quiet, and the notice still says why main was not updated', async () => {
+  const w = checkoutOnAnotherBranch();
+  const { notices, watcher } = await mergedWithRealCleanup(w.main);
+  assert.deepEqual(notices.map(n => n.wake), [false]);
+  assert.match(notices[0].text, /skipped fast-forward of .*: it is on feat\/x, not main/);
+  assert.equal(watcher.state().routes?.respond, 0);
+  assert.equal(watcher.state().routes?.candidate, 1);
+});
+
+test('an auto-merge in a loaded Pi package on another branch is quiet and lists both leftovers: no fast-forward, reload needed', async () => {
+  const w = checkoutOnAnotherBranch();
+  const { notices } = await mergedWithRealCleanup(w.main, { packages: [w.main] });
+  assert.deepEqual(notices.map(n => n.wake), [false]);
+  assert.match(notices[0].text, /skipped fast-forward[\s\S]*reload needed/);
+});
+
+test('an auto-merge in a clone sitting on its own merged branch: moved to main, branch removed, quiet', async () => {
+  const w = gitWorld();
+  run(w.main, 'checkout', '-q', '-b', 'feat/x');
+  writeFileSync(join(w.main, 'feat.txt'), 'feature'); run(w.main, 'add', '.'); run(w.main, 'commit', '-qm', 'feature');
+  const tip = run(w.main, 'rev-parse', 'HEAD');
+  run(w.main, 'push', '-q', 'origin', 'feat/x:main');
+  const { notices } = await mergedWithRealCleanup(w.main, { head: tip });
+  assert.deepEqual(notices.map(n => n.wake), [false]);
+  assert.match(notices[0].text, /switched .* from feat\/x to main/);
+  assert.equal(run(w.main, 'branch', '--show-current'), 'main');
+});
+
+test('a dirty clone on its merged branch is never switched, and a merge nobody queued here still wakes', async () => {
+  const w = gitWorld();
+  run(w.main, 'checkout', '-q', '-b', 'feat/x');
+  writeFileSync(join(w.main, 'a.txt'), 'feature'); run(w.main, 'commit', '-qam', 'feature');
+  const tip = run(w.main, 'rev-parse', 'HEAD');
+  run(w.main, 'push', '-q', 'origin', 'feat/x:main');
+  writeFileSync(join(w.main, 'a.txt'), 'edited after the commit');
+  const { notices } = await mergedWithRealCleanup(w.main, { head: tip });
+  assert.equal(run(w.main, 'branch', '--show-current'), 'feat/x');
+  assert.equal(readFileSync(join(w.main, 'a.txt'), 'utf8'), 'edited after the commit');
+  assert.doesNotMatch(notices[0].text, /switched/);
+  const foreign = await mergedWithRealCleanup(checkoutOnAnotherBranch().main, { auto: false });
+  assert.deepEqual(foreign.notices.map(n => n.wake), [true], 'merged by someone else: always a turn');
 });
 
 test('a loaded Pi package whose cleanup and fast-forward went fine: the merge is quiet and the reload line rides along', async () => {

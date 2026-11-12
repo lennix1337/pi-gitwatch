@@ -127,3 +127,68 @@ test('a package named by another spelling of the checkout git reports (8.3 short
   assert.ok(lines.some(l => l.text.startsWith('fast-forwarded main in')), lines.map(l => l.text).join(', '));
   assert.ok(lines.some(l => l.text.startsWith('reload needed')), lines.map(l => l.text).join(', '));
 });
+
+/** The main checkout on `feat/x` holding one commit (a new file) that the "other" clone lands on origin/main as a squash merge: same patch, new commit. */
+function featureOnMain(world_ = world()) {
+  const w = world_;
+  run(w.main, 'checkout', '-q', '-b', 'feat/x');
+  writeFileSync(join(w.main, 'feat.txt'), 'feature'); run(w.main, 'add', '.'); run(w.main, 'commit', '-qm', 'feature');
+  const tip = run(w.main, 'rev-parse', 'HEAD');
+  writeFileSync(join(w.other, 'feat.txt'), 'feature'); run(w.other, 'add', '.'); run(w.other, 'commit', '-qm', 'feature (squash)'); run(w.other, 'push', '-q', 'origin', 'main');
+  return { ...w, tip };
+}
+const branches = (dir: string) => run(dir, 'branch', '--format=%(refname:short)').split('\n').sort();
+
+test('a main checkout left on a feature branch whose commits all reached origin/main is moved to main, fast-forwarded, and the branch removed', async () => {
+  const w = featureOnMain();
+  const lines = await cleanupLines(gitRunner, { clone: w.main, events: [merged(7, 'deadbeef')] });
+  const text = lines.map(l => l.text).join('\n');
+  assert.ok(lines.every(l => !l.left), text);
+  assert.match(text, /switched .* from feat\/x to main: its commits are in origin\/main/);
+  assert.match(text, /removed branch feat\/x/);
+  assert.match(text, /fast-forwarded main in /);
+  assert.equal(run(w.main, 'branch', '--show-current'), 'main');
+  assert.deepEqual(branches(w.main), ['main']);
+  assert.equal(run(w.main, 'rev-parse', 'HEAD'), run(w.other, 'rev-parse', 'HEAD'));
+});
+
+test('a feature branch that is exactly the merged PR head is moved off even when the merge kept its commits as they were', async () => {
+  const w = world();
+  run(w.main, 'checkout', '-q', '-b', 'feat/x');
+  writeFileSync(join(w.main, 'feat.txt'), 'feature'); run(w.main, 'add', '.'); run(w.main, 'commit', '-qm', 'feature');
+  const tip = run(w.main, 'rev-parse', 'HEAD');
+  run(w.main, 'push', '-q', 'origin', 'feat/x:main');
+  const lines = await cleanupLines(gitRunner, { clone: w.main, events: [merged(7, tip.slice(0, 8))] });
+  assert.ok(lines.every(l => !l.left), lines.map(l => l.text).join('\n'));
+  assert.equal(run(w.main, 'branch', '--show-current'), 'main');
+  assert.deepEqual(branches(w.main), ['main']);
+});
+
+test('a feature branch with a commit origin/main does not have is never left: it stays checked out and the skip is only reported', async () => {
+  const w = featureOnMain();
+  writeFileSync(join(w.main, 'later.txt'), 'not merged'); run(w.main, 'add', '.'); run(w.main, 'commit', '-qm', 'later work');
+  const before = run(w.main, 'rev-parse', 'HEAD');
+  const lines = await cleanupLines(gitRunner, { clone: w.main, events: [merged(7, 'deadbeef')] });
+  assert.equal(run(w.main, 'branch', '--show-current'), 'feat/x');
+  assert.equal(run(w.main, 'rev-parse', 'HEAD'), before);
+  assert.match(lines.map(l => l.text).join('\n'), /skipped fast-forward of .*: it is on feat\/x, not main/);
+  assert.ok(lines.every(l => !l.left), 'being on another branch is not something the agent has to fix');
+});
+
+test('a merged feature branch with uncommitted changes to tracked files is never switched', async () => {
+  const w = featureOnMain();
+  writeFileSync(join(w.main, 'feat.txt'), 'my work in progress');
+  const lines = await cleanupLines(gitRunner, { clone: w.main, events: [merged(7, 'deadbeef')] });
+  assert.equal(run(w.main, 'branch', '--show-current'), 'feat/x');
+  assert.equal(readFileSync(join(w.main, 'feat.txt'), 'utf8'), 'my work in progress');
+  assert.ok(branches(w.main).includes('feat/x'));
+  assert.ok(!lines.some(l => l.text.startsWith('switched')), lines.map(l => l.text).join('\n'));
+});
+
+test('a branch that was just created and holds no commit of its own is not mistaken for a merged one', async () => {
+  const w = world();
+  w.merge();
+  run(w.main, 'checkout', '-q', '-b', 'fresh');
+  await cleanupLines(gitRunner, { clone: w.main, events: [merged(7, 'deadbeef')] });
+  assert.equal(run(w.main, 'branch', '--show-current'), 'fresh');
+});
