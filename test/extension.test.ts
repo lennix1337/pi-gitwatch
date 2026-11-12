@@ -273,7 +273,7 @@ test('the same merge wakes the agent when the main checkout is dirty, naming why
   assert.equal(readFileSync(join(s.main, 'a.txt'), 'utf8'), 'wip');
 });
 
-test('a script that names no clone: the loaded Pi package of that repository is the checkout (root cause of #270-#274 never being cleaned), and its merge is quiet, carrying the reload line', async () => {
+test('a script that names no clone: the loaded Pi package of that repository is the checkout (root cause of #270-#274 never being cleaned), and its merge wakes the agent, since it is not live until Pi reloads', async () => {
   const s = shipped();
   const h = harness('tui', tempDir(), undefined, { git: s.git, packages: [s.main] });
   h.gh.set(pr(35, { autoMergeRequest: {}, headRefOid: s.head.padEnd(40, '0') }, [['test', 'IN_PROGRESS']]));
@@ -282,13 +282,13 @@ test('a script that names no clone: the loaded Pi package of that repository is 
   h.gh.set(merged(35, s.head));
   await h.fire();
   assert.equal(h.sent.length, 1);
-  assert.deepEqual(h.sent[0].options, QUIET, 'a loaded package whose cleanup and fast-forward went fine needs no turn');
+  assert.deepEqual(h.sent[0].options, { triggerTurn: true, deliverAs: 'steer' }, 'a loaded package is not live until the agent reloads Pi');
   assert.match(h.sent[0].message.content, /fast-forwarded main in /);
   assert.match(h.sent[0].message.content, /reload needed: .* is a loaded Pi package/);
   assert.equal(run(s.main, 'rev-parse', 'HEAD'), run(s.other, 'rev-parse', 'HEAD'));
 });
 
-test('the same merge is quiet when the main checkout sits on another branch with its own work: no fast-forward, a reload note, no turn', async () => {
+test('the same merge wakes when the main checkout sits on another branch with its own work: no fast-forward, a reload note', async () => {
   const s = shipped();
   run(s.main, 'checkout', '-q', '-b', 'feat/y');
   writeFileSync(join(s.main, 'y.txt'), 'other work'); run(s.main, 'add', '.'); run(s.main, 'commit', '-qm', 'y');
@@ -299,7 +299,7 @@ test('the same merge is quiet when the main checkout sits on another branch with
   h.gh.set(merged(37, s.head));
   await h.fire();
   assert.equal(h.sent.length, 1);
-  assert.deepEqual(h.sent[0].options, QUIET);
+  assert.deepEqual(h.sent[0].options, { triggerTurn: true, deliverAs: 'steer' });
   assert.match(h.sent[0].message.content, /skipped fast-forward of .*: it is on feat\/y, not main/);
   assert.match(h.sent[0].message.content, /reload needed: /);
   assert.equal(run(s.main, 'branch', '--show-current'), 'feat/y');
@@ -427,9 +427,9 @@ const listen = <T>(h: { events: { on: (channel: string, fn: (data: unknown) => v
 
 test('a quiet notice is in the session as soon as it happens, visible, with no turn and no held copy', async () => {
   const s = shipped();
-  const h = harness('tui', tempDir(), undefined, { git: s.git, packages: [s.main] });
+  const h = harness('tui', tempDir(), undefined, { git: s.git });
   h.gh.set(pr(37, { autoMergeRequest: {}, headRefOid: s.head.padEnd(40, '0') }, [['test', 'IN_PROGRESS']]));
-  requestFollow(h.dir, { repo: 'o/r', pr: 37 });
+  requestFollow(h.dir, { repo: 'o/r', pr: 37, clone: s.linked });
   await h.fire();
   assert.equal(h.sent.length, 0, 'a poll with nothing to report sends nothing');
   h.gh.set(merged(37, s.head));
@@ -443,10 +443,10 @@ test('a quiet notice is in the session as soon as it happens, visible, with no t
 
 test('several quiet notices over time are each a visible message of their own, none held for the next one', async () => {
   const s = shipped();
-  const h = harness('tui', tempDir(), undefined, { git: s.git, packages: [s.main] });
+  const h = harness('tui', tempDir(), undefined, { git: s.git });
   for (const n of [60, 61, 62]) {
     h.gh.set(pr(n, { autoMergeRequest: {}, headRefOid: s.head.padEnd(40, '0') }, [['test', 'IN_PROGRESS']]));
-    requestFollow(h.dir, { repo: 'o/r', pr: n });
+    requestFollow(h.dir, { repo: 'o/r', pr: n, clone: s.main });
     await h.fire();
     h.gh.set(merged(n, s.head));
     await h.fire();
@@ -539,10 +539,10 @@ test('the request listener leaves with the session: a restarted extension answer
 
 test('a session without a UI gets the same quiet message as one with a UI', async () => {
   const s = shipped();
-  const h = harness('tui', tempDir(), undefined, { git: s.git, packages: [s.main] });
+  const h = harness('tui', tempDir(), undefined, { git: s.git });
   h.handlers.get('session_start')!({}, { mode: 'tui', hasUI: false });
   h.gh.set(pr(38, { autoMergeRequest: {}, headRefOid: s.head.padEnd(40, '0') }, [['test', 'IN_PROGRESS']]));
-  requestFollow(h.dir, { repo: 'o/r', pr: 38 });
+  requestFollow(h.dir, { repo: 'o/r', pr: 38, clone: s.linked });
   await h.fire();
   h.gh.set(merged(38, s.head));
   await h.fire();

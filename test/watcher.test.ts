@@ -633,10 +633,10 @@ test('an auto-merge whose only leftover is a clone on another branch is quiet, a
   assert.equal(watcher.state().routes?.candidate, 1);
 });
 
-test('an auto-merge in a loaded Pi package on another branch is quiet and lists both leftovers: no fast-forward, reload needed', async () => {
+test('an auto-merge in a loaded Pi package on another branch wakes and lists both leftovers: no fast-forward, reload needed', async () => {
   const w = checkoutOnAnotherBranch();
   const { notices } = await mergedWithRealCleanup(w.main, { packages: [w.main] });
-  assert.deepEqual(notices.map(n => n.wake), [false]);
+  assert.deepEqual(notices.map(n => n.wake), [true]);
   assert.match(notices[0].text, /skipped fast-forward[\s\S]*reload needed/);
 });
 
@@ -667,13 +667,12 @@ test('a dirty clone on its merged branch is never switched, and a merge nobody q
   assert.deepEqual(foreign.notices.map(n => n.wake), [true], 'merged by someone else: always a turn');
 });
 
-test('a loaded Pi package whose cleanup and fast-forward went fine: the merge is quiet and the reload line rides along', async () => {
-  const { notices, watcher } = await mergedAfterQueue([{ text: 'removed branch feat/x' }, { text: 'fast-forwarded main in /work/main to abc1234 (1 commit)' }, { text: 'reload needed: /work/main is a loaded Pi package' }]);
-  assert.deepEqual(notices.map(n => n.wake), [false]);
+test('a loaded Pi package whose cleanup and fast-forward went fine still wakes: the merge is not live until Pi reloads', async () => {
+  const { notices, watcher } = await mergedAfterQueue([{ text: 'removed branch feat/x' }, { text: 'fast-forwarded main in /work/main to abc1234 (1 commit)' }, { text: 'reload needed: /work/main is a loaded Pi package', left: true }]);
+  assert.deepEqual(notices.map(n => n.wake), [true]);
   assert.match(notices[0].text, /#90 merged abc12345/);
   assert.match(notices[0].text, /reload needed: \/work\/main is a loaded Pi package(?! \(in)/);
-  assert.equal(watcher.state().routes?.candidate, 1);
-  assert.equal(watcher.state().routes?.respond, 0);
+  assert.equal(watcher.state().routes?.respond, 1);
 });
 
 test('a loaded Pi package still wakes when its fast-forward was skipped, with the reload line in the same notice', async () => {

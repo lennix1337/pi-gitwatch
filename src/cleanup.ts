@@ -130,9 +130,8 @@ export interface CleanupOptions { packages?: string[] }
 /**
  * The cleanup results for each merged event of a clone, then one fast-forward of its main checkout and, for a loaded
  * Pi package, a `reload needed` line. A line is `left` when something stayed undone that the agent must handle (a kept
- * branch or worktree, a skipped or failed fast-forward). `reload needed` is information, not `left`: it rides along in
- * the next notice, since the merge itself needs nothing from the agent until it next restarts Pi. A clone the agent
- * already removed cannot be cleaned: that is `left`. Never throws.
+ * branch or worktree, a skipped or failed fast-forward, a loaded package that is not live until Pi reloads). A clone
+ * the agent already removed cannot be cleaned: that is `left`. Never throws.
  */
 export async function cleanupLines(git: GitRunner, notice: { clone?: string; events: { kind: string; pr: number; head?: string }[] }, options: CleanupOptions = {}): Promise<CleanupLine[]> {
   if (!notice.clone) return [];
@@ -153,7 +152,7 @@ export async function cleanupLines(git: GitRunner, notice: { clone?: string; eve
   // The checkout to update and to reload is the main one, whichever linked worktree the push came from.
   const forward = await fastForwardMain(git, main);
   if (forward) lines.push({ pr, ...forward });
-  if (isLoadedPackage(main, options.packages ?? [])) lines.push({ pr, text: `reload needed: ${main} is a loaded Pi package` });
+  if (isLoadedPackage(main, options.packages ?? [])) lines.push({ pr, text: `reload needed: ${main} is a loaded Pi package`, left: true });
   return lines;
 }
 
