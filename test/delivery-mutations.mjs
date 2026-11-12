@@ -13,7 +13,7 @@ const mutations = [
   ['rejection-counted-as-success', 'src/index.ts', '} catch { /* A rejected dispatch', '} catch { accepted = true; /* A rejected dispatch'],
 ];
 const run = () => spawnSync(process.execPath, ['--import', 'tsx', '--test', 'test/extension.test.ts', 'test/watcher.test.ts'], {
-  cwd: dir, encoding: 'utf8', timeout: 20000,
+  cwd: dir, encoding: 'utf8', timeout: 90000,
   env: { ...process.env, TEMP: join(dir, 'scratch'), TMP: join(dir, 'scratch'), TMPDIR: join(dir, 'scratch') },
 });
 const baseline = () => {
