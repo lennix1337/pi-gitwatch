@@ -152,7 +152,15 @@ export async function resolvePush(push: Push, git: GitRunner): Promise<{ repo: s
   ]);
   const repo = githubRepo(url);
   if (!repo || !branch || branch === 'HEAD' || !BRANCH.test(branch)) return undefined;
+  // `git push origin v1.2.3` names a tag when no local branch has that name: there is no branch CI to follow.
+  if (push.branch && await isTagOnly(push.dir, branch, git)) return undefined;
   return { repo, branch, ...clone ? { clone } : {} };
+}
+
+async function isTagOnly(dir: string, name: string, git: GitRunner): Promise<boolean> {
+  const exists = (ref: string) => git(['rev-parse', '--verify', '--quiet', ref], dir).then(() => true, () => false);
+  const [tag, head] = await Promise.all([exists(`refs/tags/${name}`), exists(`refs/heads/${name}`)]);
+  return tag && !head;
 }
 
 /** Where a bare `git push` goes (`@{push}`: the upstream remote and branch name, which may be a fork under another name); undefined without an upstream. */

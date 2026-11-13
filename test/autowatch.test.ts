@@ -95,3 +95,13 @@ test('a gh pr merge that merges now is an own merge; a queued one (--auto), a dr
   assert.deepEqual(ownMerges('gh pr merge 3 && gh pr merge 4 --auto', '/x'), [{ pr: 3, dir: '/x' }], 'each command of a chain is read');
   assert.deepEqual(ownMerges('cd sub && gh pr merge 5', '/x'), [{ pr: 5, dir: resolve('/x', 'sub') }], 'the merge runs where the cd leads');
 });
+
+// Seen live 2026-11-13: `git push origin v0.1.1` ended in "Branch v0.1.1 not found in lennix1337/pi-vault", a tag read as a branch.
+test('a push of a tag name follows nothing; a branch of the same repository still does', async () => {
+  const git = async (args: string[]) => {
+    if (args[0] === 'rev-parse' && args[1] === '--verify') { if (args.at(-1) === 'refs/tags/v0.1.1') return 'abc'; throw new Error('unknown ref'); }
+    return args[0] === 'remote' ? 'https://github.com/lennix1337/pi-vault.git' : args[1] === '--show-toplevel' ? 'C:/w' : 'main';
+  };
+  assert.equal(await resolvePush({ dir: '/w', remote: 'origin', branch: 'v0.1.1' }, git), undefined);
+  assert.deepEqual(await resolvePush({ dir: '/w', remote: 'origin', branch: 'feat' }, git), { repo: 'lennix1337/pi-vault', branch: 'feat', clone: 'C:/w' });
+});
