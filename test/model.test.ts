@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { AUTO_MERGE_STALL_MS, autoMergeStall, branchDiff, branchHint, branchLine, diff, hint, jobsText, line, normalize, normalizeBranch, settle, summarizeChecks, type WatchEvent } from '../src/model.ts';
 import { announce, handledMerge, routeEvent } from '../src/route.ts';
 import type { RawPullRequest } from '../src/model.ts';
-import { commit, pr } from './fixtures.ts';
+import { commit, jobsOf, pr, REFUSED_JOBS, rollup, running } from './fixtures.ts';
 
 const ctx = (name: string, status: string, conclusion: string | null = null) => ({ __typename: 'CheckRun', name, status, conclusion });
 
@@ -204,4 +204,54 @@ test('pendingSince is the start of the oldest running check; finished checks and
   assert.equal(summarizeChecks([{ __typename: 'StatusContext', context: 'ci', state: 'PENDING', createdAt: recent }]).pendingSince, Date.parse(recent));
   assert.equal('pendingSince' in summarizeChecks([run('a', 'IN_PROGRESS')]), false, 'no start time known');
   assert.equal('pendingSince' in summarizeChecks([run('a', 'COMPLETED', old)]), false, 'nothing running');
+});
+
+const NEVER_STARTED = 'checks failed: never started (no step ran): test (ubuntu-24.04), test (windows-latest)';
+const validateLocally = (head: string) => `validate ${head} locally and treat that result as the gate: no job ran a step, so there is no log (typically billing or a spending limit). GitHub's reason: gh run view 7701 --repo o/r`;
+
+test('jobs GitHub never started are told apart from a failure: the event says no step ran and the next step is local validation, not a log that does not exist', () => {
+  const none = new Map(REFUSED_JOBS.map(j => [j.id, 0]));
+  const before = normalize(pr(6, { commits: jobsOf(running(REFUSED_JOBS)) }));
+  const refused = normalize(pr(6, { mergeStateStatus: 'UNSTABLE', commits: jobsOf(REFUSED_JOBS) }), none);
+  assert.deepEqual([refused.checks.state, refused.checks.fail, refused.checks.failing], ['fail', 2, ['test (ubuntu-24.04)', 'test (windows-latest)']], 'GitHub concluded them as failed and cancelled: they still count as failing');
+  assert.deepEqual(diff(before, refused).map(e => [e.kind, e.wake, e.text]), [['checks', true, NEVER_STARTED], ['mergeState', false, 'mergeable with non-required failures (UNSTABLE)']]);
+  assert.equal(hint(refused, 'o/r'), validateLocally('6aaaaaaa'));
+  assert.match(line(refused), /^#6 UNSTABLE · checks never started 0✓ 2✗ 0… \[test \(ubuntu-24\.04\), test \(windows-latest\)\] · 6aaaaaaa/);
+
+  const head = { ...commit('c0ffee'), statusCheckRollup: rollup(REFUSED_JOBS) };
+  const pushed = branchDiff(normalizeBranch('main', { ...head, statusCheckRollup: rollup(running(REFUSED_JOBS)) }), normalizeBranch('main', head, none));
+  assert.deepEqual(pushed.events.map(e => [e.wake, e.text]), [[true, NEVER_STARTED]], 'the CI of a direct push says the same');
+  assert.equal(branchHint(pushed.snapshot, 'o/r'), validateLocally('c0ffee00'));
+  assert.match(branchLine(pushed.snapshot), /^main @c0ffee00 · checks never started 0✓ 2✗ 0…/);
+});
+
+test('a failure is called never started only when every failed job is an Actions job that ran no step; anything else keeps the failure and its log command', () => {
+  const before = normalize(pr(6, { commits: jobsOf(running(REFUSED_JOBS)) }));
+  const log = 'read the failing job log: gh run view 7701 --repo o/r --log-failed ; gh run view 7702 --repo o/r --log-failed';
+  const steps = (count: (id: string) => [string, number][]) => new Map(REFUSED_JOBS.flatMap(j => count(j.id)));
+  const cases: [string, Map<string, number> | undefined][] = [
+    ['every job ran steps', steps(id => [[id, 9]])],
+    ['one job ran steps next to three that ran none', steps(id => [[id, id === 'CR_windows_pull' ? 9 : 0]])],
+    ['the count of one job was not answered', steps(id => (id === 'CR_ubuntu_push' ? [] : [[id, 0]]))],
+    ['no count was read', undefined],
+    ['counts filed under the run or the job of the details link, not the check run', new Map(REFUSED_JOBS.flatMap(j => [[`${j.run}`, 0], [`${j.job}`, 0]] as [string, number][]))],
+  ];
+  for (const [what, counts] of cases) {
+    const failed = normalize(pr(6, { commits: jobsOf(REFUSED_JOBS) }), counts);
+    assert.equal(diff(before, failed)[0].text, 'checks failed: test (ubuntu-24.04), test (windows-latest)', what);
+    assert.equal(hint(failed, 'o/r'), log, what);
+    assert.equal('neverStarted' in failed.checks, false, what);
+    assert.match(line(failed), /checks fail 0✓ 2✗ 0…/, what);
+  }
+  // A commit status and another app's check have no steps by nature: one of them failing means something did run.
+  const others = [
+    { __typename: 'StatusContext', context: 'ci/external', state: 'FAILURE', targetUrl: 'https://ci.example/1' },
+    { __typename: 'CheckRun', id: 'CR_coverage', name: 'coverage', status: 'COMPLETED', conclusion: 'FAILURE', detailsUrl: 'https://coverage.example/report/1' },
+  ];
+  for (const other of others) {
+    const mixed = pr(6, { commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: [...rollup(REFUSED_JOBS).contexts.nodes, other] } } } }] } });
+    const failed = normalize(mixed, new Map([...REFUSED_JOBS.map(j => [j.id, 0] as [string, number]), ['CR_coverage', 0]]));
+    assert.match(diff(before, failed)[0].text, /^checks failed: (ci\/external|coverage), test \(ubuntu-24\.04\), test \(windows-latest\)$/);
+    assert.equal(hint(failed, 'o/r'), log);
+  }
 });

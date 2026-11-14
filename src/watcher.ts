@@ -2,10 +2,10 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { CleanupLine } from './cleanup.ts';
-import { fetchRepo, lookupPush, MAX_BRANCHES, MAX_PRS, type Runner } from './github.ts';
+import { fetchRepo, fetchSteps, lookupPush, MAX_BRANCHES, MAX_PRS, type Runner } from './github.ts';
 import {
-  autoMergeStall, baselineBranch, branchDiff, branchHint, branchLine, brt, diff, hint, jobsText, line, normalize, normalizeBranch, settle,
-  type Announced, type BranchSnapshot, type RawCommit, type Snapshot, type WatchEvent,
+  autoMergeStall, baselineBranch, branchDiff, branchHint, branchLine, brt, diff, failedJobIds, headRollup, hint, jobsText, line, normalize, normalizeBranch, settle, stepsUnread,
+  type Announced, type BranchSnapshot, type Checks, type RawCommit, type Snapshot, type Steps, type WatchEvent,
 } from './model.ts';
 import { announce, handledMerge, routeEvent, type Decision } from './route.ts';
 
@@ -383,9 +383,27 @@ export class Watcher {
     // A list watch that only holds candidates for later has nothing to read: no GraphQL request without a PR or branch.
     if (watch.mode === 'list' && !tracked.length && !names.length) return { snapshots: new Map<number, Snapshot>(), open: undefined, branches: new Map<string, BranchSnapshot>() };
     const fetched = await fetchRepo(this.run, repo, tracked, watch.mode === 'open', signal, names);
-    const branches = new Map<string, BranchSnapshot>();
-    for (const [name, raw] of fetched.branches) if (raw) branches.set(name, normalizeBranch(name, raw));
-    return { snapshots: new Map([...fetched.prs].map(([n, raw]) => [n, normalize(raw)])), open: fetched.open, branches };
+    // A PR removed from an open watch is re-read on every poll and never stored: its failure would look new each time.
+    const prs = [...fetched.prs].map(([n, raw]) => ({ n, read: reading(watch.snapshots[n], headRollup(raw), !watch.ignore?.includes(n), steps => normalize(raw, steps)) }));
+    const heads = [...fetched.branches].flatMap(([name, raw]) => raw ? [{ name, read: reading(watch.branches?.[name], raw.statusCheckRollup, true, steps => normalizeBranch(name, raw, steps)) }] : []);
+    const steps = await this.stepsOf([...prs, ...heads].flatMap(r => r.read.ask ?? []), signal);
+    return {
+      snapshots: new Map(prs.map(({ n, read }) => [n, snapshotOf(read, steps)])), open: fetched.open,
+      branches: new Map(heads.map(({ name, read }) => [name, snapshotOf(read, steps)])),
+    };
+  }
+
+  /**
+   * The steps these failed jobs ran, in one request for all of them, or the reason they could not be read. A failed read
+   * neither drops nor postpones the failure it is about: that one is announced as an ordinary failure and keeps the reason.
+   */
+  private async stepsOf(ids: string[], signal?: AbortSignal): Promise<Steps | string> {
+    if (!ids.length) return new Map();
+    try { return await fetchSteps(this.run, ids, signal); }
+    catch (error) {
+      if (signal?.aborted) throw error;
+      return (error instanceof Error ? error.message : String(error)) || 'no reason given';
+    }
   }
 
   /**
@@ -410,6 +428,38 @@ export class Watcher {
     }
     pruneSubscribers(watch);
   }
+}
+
+/** A commit and its checks: what a PR snapshot and a branch snapshot have in common. */
+interface Head { head: string; checks: Checks }
+
+/** Whether the failure stored for a head is the one just read: the same commit with the same failing checks. */
+const sameFailure = (stored: Head | undefined, read: Head): stored is Head =>
+  stored !== undefined && stored.head === read.head && stored.checks.state === 'fail' && read.checks.state === 'fail' && stored.checks.failing.join() === read.checks.failing.join();
+
+/**
+ * A head as it was just read (`plain`: without step counts), next to what is stored for it. `ask` holds the node ids of
+ * its failed jobs when its failure is not the stored one and is made of GitHub Actions jobs: only then, so once per
+ * failure, is GitHub asked whether those jobs ran a step.
+ */
+interface Reading<S extends Head> { stored: S | undefined; plain: S; ask: string[] | undefined; build: (steps: Steps) => S }
+
+function reading<S extends Head>(stored: S | undefined, rollup: RawCommit['statusCheckRollup'] | undefined, followed: boolean, build: (steps?: Steps) => S): Reading<S> {
+  const plain = build();
+  const fresh = followed && plain.checks.state === 'fail' && !sameFailure(stored, plain);
+  return { stored, plain, build, ask: fresh ? failedJobIds(rollup, plain.checks.failing) : undefined };
+}
+
+/**
+ * The snapshot of a head once the step counts were asked for. A new failure is read again with them; when they could not
+ * be read (`steps` is the reason) it stays an ordinary failure that carries that reason. A failure already stored keeps
+ * what was learned about it.
+ */
+function snapshotOf<S extends Head>({ stored, plain, ask, build }: Reading<S>, steps: Steps | string): S {
+  if (ask) return typeof steps === 'string' ? { ...plain, checks: { ...plain.checks, stepsError: steps } } : build(steps);
+  if (!sameFailure(stored, plain)) return plain;
+  const { neverStarted, stepsError } = stored.checks;
+  return { ...plain, checks: { ...plain.checks, ...neverStarted ? { neverStarted } : {}, ...stepsError ? { stepsError } : {} } };
 }
 
 /**
@@ -635,11 +685,11 @@ function repoStatus(repo: string, w: RepoWatch, events: WatchEvent[]): string {
   const changes = events.filter(isShown);
   const changed = changes.length ? `\nchanged since last poll: ${changes.map(e => `${e.branch ?? `#${e.pr}`} ${e.text}`).join('; ')}` : '';
   const waiting = Object.entries(w.held ?? {}).map(([key, h]) => `\nwaiting ${key === 'main' ? 'for your next turn' : `for ${key.slice('sub:'.length)}`}: ${pendingText(repo, h.items, h.omitted ?? 0)}`).join('');
-  const withNext = (text: string, next?: string, jobs?: string) => `${text}${next ? `\n  next: ${next}` : ''}${jobs ? `\n  ${jobs}` : ''}`;
+  const withNext = (text: string, next?: string, jobs?: string, unread?: string) => `${text}${next ? `\n  next: ${next}` : ''}${jobs ? `\n  ${jobs}` : ''}${unread ? `\n  ${unread}` : ''}`;
   const tag = (key: string) => (w.subscribers?.[key] ? ` · for ${w.subscribers[key]}` : '');
   const rows = [
-    ...prs.map(s => withNext(`${line(s)}${tag(`pr:${s.number}`)}`, hint(s, repo), jobsText(s.checks, repo, { pr: s.number }))),
-    ...Object.values(w.branches ?? {}).map(b => withNext(`${branchLine(b)}${tag(`branch:${b.branch}`)}`, branchHint(b, repo), jobsText(b.checks, repo, { branch: b.branch }))),
+    ...prs.map(s => withNext(`${line(s)}${tag(`pr:${s.number}`)}`, hint(s, repo), jobsText(s.checks, repo, { pr: s.number }), stepsUnread(s.checks))),
+    ...Object.values(w.branches ?? {}).map(b => withNext(`${branchLine(b)}${tag(`branch:${b.branch}`)}`, branchHint(b, repo), jobsText(b.checks, repo, { branch: b.branch }), stepsUnread(b.checks))),
   ];
   const empty = w.mode === 'open' ? 'no open PRs; new ones will be reported' : 'nothing left to follow';
   return [`${repo} · ${totals} · ${polled}${error}${changed}${waiting}`, ...rows.length ? rows : [empty]].join('\n');

@@ -4,10 +4,10 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { gitRunner } from '../src/autowatch.ts';
 import { cleanupLines } from '../src/cleanup.ts';
-import { type Runner, query } from '../src/github.ts';
+import { type Runner, fetchSteps, query, stepsQuery } from '../src/github.ts';
 import type { RawPullRequest } from '../src/model.ts';
 import { FAILURES_BEFORE_NOTICE, statusText, Store, Watcher, watchPush } from '../src/watcher.ts';
-import { commit, FakeGitHub, gitWorld, pr, run, tempDir } from './fixtures.ts';
+import { commit, FakeGitHub, gitWorld, jobsOf, pr, REFUSED_JOBS, rollup, run, running, tempDir, type Job } from './fixtures.ts';
 
 const setup = () => {
   const gh = new FakeGitHub();
@@ -333,6 +333,102 @@ test('a failing check names its job links in the notice, and status keeps them',
   assert.match(statusText(watcher.state(), new Map(), 'o/r', 0), /jobs: e2e https:\/\/github\.com\/o\/r\/actions\/runs\/61\/job\/4/);
 });
 
+/** A watched PR #6 whose jobs are running; `finish` ends them the way GitHub ended the refused ones and counts the gh calls of the next poll. */
+const refusedPr = async () => {
+  const { gh, watcher, tick } = setup();
+  gh.set(pr(6, { commits: jobsOf(running(REFUSED_JOBS)) }));
+  await watcher.watch('o/r', { prs: [6] });
+  const poll = async () => { tick(); gh.calls.length = 0; const { notices } = await watcher.poll(); return { notices, calls: gh.calls.length }; };
+  const finish = () => { gh.set(pr(6, { mergeStateStatus: 'UNSTABLE', commits: jobsOf(REFUSED_JOBS) })); return poll(); };
+  return { gh, watcher, poll, finish };
+};
+
+test('a pull request whose jobs never started wakes saying so; the step count is asked once, by check-run id, when the failure is new', async () => {
+  const { gh, watcher, poll, finish } = await refusedPr();
+  for (const j of REFUSED_JOBS) gh.steps.set(j.id, 0);
+  const { notices, calls } = await finish();
+  assert.equal(calls, 2, 'the poll, then one request for the steps of the failed jobs');
+  for (const j of REFUSED_JOBS) assert.ok(gh.calls[1].join(' ').includes(`"${j.id}"`), `${j.id} is asked about by its node id`);
+  assert.deepEqual(notices.map(n => n.wake), [true]);
+  assert.match(notices[0].text, /#6 checks failed: never started \(no step ran\): test \(ubuntu-24\.04\), test \(windows-latest\)\n {2}#6 UNSTABLE · checks never started 0✓ 2✗ 0… /);
+  assert.match(notices[0].text, /\n {2}next: validate 6aaaaaaa locally and treat that result as the gate: [^\n]* gh run view 7701 --repo o\/r\n/);
+  assert.doesNotMatch(notices[0].text, /--log-failed/);
+  for (let i = 0; i < 2; i++) assert.deepEqual(await poll(), { notices: [], calls: 1 }, 'the failure already stored is not asked about again');
+  assert.match(statusText(watcher.state(), new Map(), 'o/r', 0), /checks never started 0✓ 2✗ 0…[^\n]*\n {2}next: validate 6aaaaaaa locally/, 'what was learned stays with the stored failure');
+});
+
+test('a failure whose jobs ran steps is announced as a failure with its log command, after the same single request; a failure that includes a commit status is not asked about', async () => {
+  const { gh, watcher, poll, finish } = await refusedPr();
+  for (const j of REFUSED_JOBS) gh.steps.set(j.id, j.conclusion === 'FAILURE' ? 9 : 0);
+  const { notices, calls } = await finish();
+  assert.equal(calls, 2);
+  assert.match(notices[0].text, /#6 checks failed: test \(ubuntu-24\.04\), test \(windows-latest\)\n {2}#6 UNSTABLE · checks fail 0✓ 2✗ 0… /);
+  assert.match(notices[0].text, /next: read the failing job log: gh run view 7701 --repo o\/r --log-failed ; gh run view 7702 --repo o\/r --log-failed/);
+  assert.deepEqual(await poll(), { notices: [], calls: 1 });
+
+  // A commit status failing next to a job reported from somewhere else: the failure is real whatever the job did.
+  const lint: Job = { id: 'CR_lint', name: 'lint', conclusion: 'FAILURE', run: 7703, job: 880031 };
+  const external = (state: string) => ({ __typename: 'StatusContext', context: 'ci/external', state, targetUrl: 'https://ci.example/1' });
+  const mixed = (jobs: Job[], state: string) => pr(7, { commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: [...rollup(jobs).contexts.nodes, external(state)] } } } }] } });
+  gh.steps.set(lint.id, 0);
+  gh.set(mixed(running([lint]), 'PENDING'));
+  await watcher.watch('o/r', { prs: [7] });
+  gh.set(mixed([lint], 'FAILURE'));
+  const real = await poll();
+  assert.equal(real.calls, 1, 'nothing to ask');
+  assert.match(real.notices[0].text, /#7 checks failed: ci\/external, lint\n[\s\S]*next: read the failing job log: gh run view 7703 --repo o\/r --log-failed/);
+});
+
+test('when the step count cannot be read the failure is announced in the same poll as an ordinary one; status keeps why, and that never wakes the agent', async () => {
+  const { gh, watcher, poll, finish } = await refusedPr();
+  gh.failSteps = 'gh: HTTP 502';
+  const { notices, calls } = await finish();
+  assert.equal(calls, 2);
+  assert.deepEqual(notices.map(n => n.wake), [true], 'the wake is not held back');
+  assert.match(notices[0].text, /#6 checks failed: test \(ubuntu-24\.04\), test \(windows-latest\)\n {2}#6 UNSTABLE · checks fail 0✓ 2✗ 0… /);
+  assert.match(notices[0].text, /next: read the failing job log: gh run view 7701 --repo o\/r --log-failed ; gh run view 7702 --repo o\/r --log-failed/);
+  assert.doesNotMatch(notices[0].text, /HTTP 502|step count/, 'the notice reads as it did before the count existed');
+  assert.equal(watcher.state().repos['o/r'].failures, 0, 'the repository was read: this is not a failed poll');
+  for (let i = 0; i <= FAILURES_BEFORE_NOTICE; i++) assert.deepEqual(await poll(), { notices: [], calls: 1 }, 'neither asked again nor announced');
+  assert.match(statusText(watcher.state(), new Map(), 'o/r', 0), /#6 UNSTABLE · checks fail 0✓ 2✗ 0…[^\n]*\n {2}next: read the failing job log[^\n]*\n {2}jobs: [^\n]*\n {2}step count of the failed jobs unread \(gh: HTTP 502\): if they never started, there is no log/);
+});
+
+test('a PR removed from an open watch is re-read on every poll but its failure is never asked about', async () => {
+  const { gh, watcher, tick } = setup();
+  gh.set(pr(6, { commits: jobsOf(running(REFUSED_JOBS)) }));
+  await watcher.watch('o/r');
+  await watcher.unwatch('o/r', [6]);
+  for (const j of REFUSED_JOBS) gh.steps.set(j.id, 0);
+  gh.set(pr(6, { commits: jobsOf(REFUSED_JOBS) }));
+  for (let i = 0; i < 3; i++) {
+    tick(); gh.calls.length = 0;
+    assert.deepEqual((await watcher.poll()).notices, []);
+    assert.equal(gh.calls.length, 1, 'it is not stored, so its failure would look new on every poll');
+  }
+});
+
+test('a direct push whose CI never started is reported once for the branch; watching a pull request already in that state asks once and announces nothing', async () => {
+  const { gh, watcher, tick } = setup();
+  for (const j of REFUSED_JOBS) gh.steps.set(j.id, 0);
+  const head = commit('c0ffee');
+  gh.branches.set('main', { ...head, statusCheckRollup: rollup(running(REFUSED_JOBS)) });
+  await watcher.watch('o/r', { branch: 'main' });
+  gh.branches.set('main', { ...head, statusCheckRollup: rollup(REFUSED_JOBS) }); tick();
+  gh.calls.length = 0;
+  const { notices } = await watcher.poll();
+  assert.equal(gh.calls.length, 2);
+  assert.match(notices[0].text, /main checks failed: never started \(no step ran\): test \(ubuntu-24\.04\), test \(windows-latest\)\n {2}main @c0ffee00 · checks never started 0✓ 2✗ 0… [^\n]*\n {2}next: validate c0ffee00 locally/);
+
+  gh.set(pr(6, { commits: jobsOf(REFUSED_JOBS) }));
+  gh.calls.length = 0;
+  await watcher.watch('o/r', { prs: [6] });
+  assert.equal(gh.calls.length, 2, 'a watch that starts on a failure asks about it once');
+  assert.match(statusText(watcher.state(), new Map(), 'o/r', 0), /#6 BLOCKED · checks never started 0✓ 2✗ 0…/);
+  tick(); gh.calls.length = 0;
+  assert.deepEqual((await watcher.poll()).notices, [], 'a watch is a baseline');
+  assert.equal(gh.calls.length, 1);
+});
+
 test('a CI rerun that passes again on an announced head is a candidate, not a second turn', async () => {
   const { gh, watcher, tick } = setup();
   gh.set(pr(2, { mergeStateStatus: 'BLOCKED' }, [['test', 'IN_PROGRESS']]));
@@ -495,6 +591,19 @@ test('the GraphQL query asks for each PR head branch, so a notice can name it', 
 test('the GraphQL query asks for the required checks of each PR base, from branch protection and rulesets', () => {
   assert.match(query([1], false), /baseRef \{ branchProtectionRule \{ requiredStatusCheckContexts \}/);
   assert.match(query([1], false), /RequiredStatusChecksParameters \{ requiredStatusChecks \{ context \}/);
+});
+
+test('the GraphQL query asks for each check run node id, of PR heads and branch heads, and the step-count query names check runs by it', () => {
+  assert.match(query([1], true), /\.\.\. on CheckRun \{ id name status conclusion detailsUrl startedAt \}/);
+  assert.match(query([], false, ['main']), /refs\/heads\/main"\) \{ target \{ \.\.\. on Commit \{ oid messageHeadline statusCheckRollup \{ contexts\(first: 100\) \{ nodes \{ __typename\s+\.\.\. on CheckRun \{ id /);
+  assert.equal(stepsQuery(['CR_a', 'CR_"b']), 'query { nodes(ids: ["CR_a", "CR_\\"b"]) { ... on CheckRun { id steps(first: 1) { totalCount } } } }');
+});
+
+test('step counts are read per check run node id: an id GitHub did not resolve has no count, and an answer without nodes is an error', async () => {
+  const answer = (body: unknown): Runner => async () => JSON.stringify(body);
+  const nodes = [{ id: 'CR_a', steps: { totalCount: 0 } }, null, { id: 'CR_c', steps: { totalCount: 9 } }];
+  assert.deepEqual([...await fetchSteps(answer({ data: { nodes } }), ['CR_a', 'CR_b', 'CR_c'])], [['CR_a', 0], ['CR_c', 9]]);
+  await assert.rejects(fetchSteps(answer({ errors: [{ message: 'Something went wrong' }] }), ['CR_a']), /^Error: Something went wrong$/);
 });
 
 test('a held change of the same PR and kind is superseded by the wake that states it', async () => {

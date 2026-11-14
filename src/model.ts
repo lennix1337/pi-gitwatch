@@ -11,6 +11,13 @@ export interface Checks {
   failedJobs: FailedJob[];
   /** Ms epoch of the oldest still-running check, when GitHub gave a start time for one. */
   pendingSince?: number;
+  /**
+   * Every failed job is a GitHub Actions job that ran no step: GitHub ended them without starting them (typically for
+   * billing or a spending limit), so nothing was tested and there is no log.
+   */
+  neverStarted?: true;
+  /** Why the step count of the failed jobs could not be read, when it could not: the failure then reads as an ordinary one. */
+  stepsError?: string;
 }
 /** The slots whose last announced value decides whether a repeated confirmation is news. */
 export type Slot = 'checks' | 'mergeState';
@@ -49,6 +56,8 @@ export interface WatchEvent {
 interface RawContext {
   __typename?: string; name?: string; status?: string; conclusion?: string | null; context?: string; state?: string;
   detailsUrl?: string | null; targetUrl?: string | null;
+  /** A check run's node id: what a step-count request names it by. Not the run or the job of its details link. */
+  id?: string;
   /** When a check run started, or a commit status was created: the clock of a check that is still running. */
   startedAt?: string | null; createdAt?: string | null;
 }
@@ -99,8 +108,28 @@ function failedJobs(contexts: RawContext[], failing: string[]): FailedJob[] {
   return [...jobs.values()].sort(byName);
 }
 
-/** One verdict per check name: a rerun or a duplicate workflow cancelled next to a passing twin is not a failure. */
-export function summarizeChecks(contexts: RawContext[]): Checks {
+/** The steps check runs executed, by node id, as far as they were read. */
+export type Steps = ReadonlyMap<string, number>;
+
+/** The failed runs of the failing checks. */
+const failedOf = (contexts: RawContext[], failing: string[]) => contexts.filter(c => failing.includes(c.name ?? c.context ?? '?') && verdict(c) === 'fail');
+/** A GitHub Actions job. A commit status or another app's check has no steps by nature: its failure means something did run. */
+const isJob = (c: RawContext) => c.id !== undefined && runId(c) !== undefined;
+
+/** The check rollup of a pull request's head commit. */
+export const headRollup = (raw: RawPullRequest) => raw.commits?.nodes[0]?.commit.statusCheckRollup;
+
+/** The node ids of the failed jobs behind `failing`, to ask how many steps each ran; undefined unless all of them are Actions jobs. */
+export function failedJobIds(rollup: RawCommit['statusCheckRollup'] | undefined, failing: string[]): string[] | undefined {
+  const failed = failedOf(rollup?.contexts.nodes ?? [], failing);
+  return failed.length && failed.every(isJob) ? failed.map(c => c.id!) : undefined;
+}
+
+/**
+ * One verdict per check name: a rerun or a duplicate workflow cancelled next to a passing twin is not a failure.
+ * With `steps`, a failure whose failed jobs all ran no step is marked as never started.
+ */
+export function summarizeChecks(contexts: RawContext[], steps?: Steps): Checks {
   const byName = new Map<string, Verdict[]>();
   for (const c of contexts) byName.set(c.name ?? c.context ?? '?', [...byName.get(c.name ?? c.context ?? '?') ?? [], verdict(c)]);
   const checks: Checks = { state: 'none', pass: 0, fail: 0, pending: 0, skipped: 0, failing: [], runs: [], failedJobs: [] };
@@ -116,6 +145,7 @@ export function summarizeChecks(contexts: RawContext[]): Checks {
   const started = contexts.filter(c => verdict(c) === 'pending').map(c => Date.parse(c.startedAt ?? c.createdAt ?? '')).filter(Number.isFinite);
   if (started.length) checks.pendingSince = Math.min(...started);
   checks.state = checks.pending > 0 ? 'pending' : checks.fail > 0 ? 'fail' : checks.pass > 0 ? 'pass' : 'none';
+  if (steps && checks.state === 'fail' && failedOf(contexts, checks.failing).every(c => isJob(c) && steps.get(c.id!) === 0)) checks.neverStarted = true;
   return checks;
 }
 
@@ -134,15 +164,14 @@ function missingRequired(raw: RawPullRequest, contexts: RawContext[]): Pick<Snap
   return { missingRequired: missing, headRuns: runs };
 }
 
-export function normalize(raw: RawPullRequest): Snapshot {
-  const rollup = raw.commits?.nodes[0]?.commit.statusCheckRollup;
-  const contexts = rollup?.contexts.nodes ?? [];
+export function normalize(raw: RawPullRequest, steps?: Steps): Snapshot {
+  const contexts = headRollup(raw)?.contexts.nodes ?? [];
   const state = raw.state === 'MERGED' || raw.state === 'CLOSED' ? raw.state : 'OPEN';
   return {
     number: raw.number, title: raw.title, url: raw.url, author: raw.author?.login ?? 'ghost', state, draft: raw.isDraft,
     mergeState: raw.mergeStateStatus, review: raw.reviewDecision, head: raw.headRefOid.slice(0, 8), auto: raw.autoMergeRequest != null,
     ...raw.headRefName ? { branch: raw.headRefName } : {},
-    mergeCommit: raw.mergeCommit?.oid.slice(0, 8) ?? null, checks: summarizeChecks(contexts),
+    mergeCommit: raw.mergeCommit?.oid.slice(0, 8) ?? null, checks: summarizeChecks(contexts, steps),
     ...missingRequired(raw, contexts),
   };
 }
@@ -180,7 +209,7 @@ export function diff(prev: Snapshot | undefined, cur: Snapshot): WatchEvent[] {
   if (b.state !== a.state || (b.state === 'fail' && b.failing.join() !== a.failing.join())) {
     // With auto-merge on, passing checks need nothing from the agent: the merge (or a stall) is what gets reported.
     if (b.state === 'pass') events.push({ pr, kind: 'checks', text: passedText(b), wake: !cur.auto });
-    else if (b.state === 'fail') events.push({ pr, kind: 'checks', text: `checks failed: ${b.failing.join(', ')}`, wake: b.pending === 0 || a.state !== 'fail' });
+    else if (b.state === 'fail') events.push({ pr, kind: 'checks', text: failedText(b), wake: b.pending === 0 || a.state !== 'fail' });
     else if (b.state === 'pending') events.push({ pr, kind: 'checks', text: `checks running (${b.pending} pending)`, wake: false });
   }
   if (cur.mergeState !== prev.mergeState && cur.mergeState !== 'UNKNOWN') {
@@ -193,6 +222,8 @@ export function diff(prev: Snapshot | undefined, cur: Snapshot): WatchEvent[] {
 }
 
 const passedText = (c: Checks) => `checks passed ${c.pass}/${c.pass + c.fail}${c.skipped ? `, ${c.skipped} skipped` : ''}`;
+/** Jobs that never started are failed checks to GitHub: the text opens as any failure does, then says what was observed. */
+const failedText = (c: Checks) => `checks failed: ${c.neverStarted ? 'never started (no step ran): ' : ''}${c.failing.join(', ')}`;
 
 /** How long auto-merge may sit on a PR whose checks passed before the agent is told it is stuck. */
 export const AUTO_MERGE_STALL_MS = 10 * 60_000;
@@ -215,8 +246,8 @@ export function autoMergeStall(prev: Snapshot | undefined, cur: Snapshot, now: n
 
 const isFinal = (c: Checks) => c.pending === 0 && (c.state === 'pass' || c.state === 'fail');
 
-export function normalizeBranch(branch: string, raw: RawCommit): BranchSnapshot {
-  return { branch, head: raw.oid.slice(0, 8), headline: raw.messageHeadline, checks: summarizeChecks(raw.statusCheckRollup?.contexts.nodes ?? []), reported: false };
+export function normalizeBranch(branch: string, raw: RawCommit, steps?: Steps): BranchSnapshot {
+  return { branch, head: raw.oid.slice(0, 8), headline: raw.messageHeadline, checks: summarizeChecks(raw.statusCheckRollup?.contexts.nodes ?? [], steps), reported: false };
 }
 
 /** A new watch is a baseline: CI already finished at that point is not announced again. */
@@ -231,14 +262,19 @@ export function branchDiff(prev: BranchSnapshot | undefined, cur: BranchSnapshot
   if (prev.head !== cur.head) events.push({ pr: 0, branch, kind: 'push', text: `new commit ${cur.head}`, wake: false });
   if (!reported && isFinal(cur.checks)) {
     const c = cur.checks;
-    events.push({ pr: 0, branch, kind: 'checks', text: c.state === 'pass' ? passedText(c) : `checks failed: ${c.failing.join(', ')}`, wake: true });
+    events.push({ pr: 0, branch, kind: 'checks', text: c.state === 'pass' ? passedText(c) : failedText(c), wake: true });
     return { snapshot: { ...cur, reported: true }, events };
   }
   return { snapshot: { ...cur, reported }, events };
 }
 
-/** The command that shows why a check failed: the Actions log when the run is known, else the PR checks. */
-function failingLog(c: Checks, repo: string, pr?: number): string {
+/**
+ * The command that shows why a check failed: the Actions log when the run is known, else the PR checks. Jobs that never
+ * started left no log (`--log-failed` answers "log not found"): what is left is validating `head` locally, and the run
+ * page, which carries GitHub's reason as an annotation.
+ */
+function failingLog(c: Checks, repo: string, head: string, pr?: number): string {
+  if (c.neverStarted) return `validate ${head} locally and treat that result as the gate: no job ran a step, so there is no log (typically billing or a spending limit). GitHub's reason: gh run view ${c.runs[0]} --repo ${repo}`;
   if (c.runs.length) return `read the failing job log: ${c.runs.slice(0, 3).map(id => `gh run view ${id} --repo ${repo} --log-failed`).join(' ; ')}`;
   return pr ? `read the failing job log: gh pr checks ${pr} --repo ${repo}` : 'open the failing check on GitHub';
 }
@@ -248,7 +284,7 @@ export const brt = (ms: number) => new Date(ms).toLocaleTimeString('pt-BR', { ti
 
 const short = (s: string, n = 60) => s.length > n ? `${s.slice(0, n - 1)}…` : s;
 
-const checksText = (c: Checks) => c.state === 'none' ? 'no checks' : `checks ${c.state} ${c.pass}✓ ${c.fail}✗ ${c.pending}…${c.failing.length ? ` [${c.failing.join(', ')}]` : ''}`;
+const checksText = (c: Checks) => c.state === 'none' ? 'no checks' : `checks ${c.neverStarted ? 'never started' : c.state} ${c.pass}✓ ${c.fail}✗ ${c.pending}…${c.failing.length ? ` [${c.failing.join(', ')}]` : ''}`;
 
 /** One compact line per watched branch: its latest commit and CI. */
 export function branchLine(s: BranchSnapshot): string {
@@ -256,7 +292,7 @@ export function branchLine(s: BranchSnapshot): string {
 }
 
 export function branchHint(s: BranchSnapshot, repo: string): string | undefined {
-  return s.checks.state === 'fail' && s.checks.pending === 0 ? failingLog(s.checks, repo) : undefined;
+  return s.checks.state === 'fail' && s.checks.pending === 0 ? failingLog(s.checks, repo, s.head) : undefined;
 }
 
 /** Titles longer than this are cut in a notice; the PR URL is the pointer to the rest. */
@@ -282,11 +318,15 @@ export function jobsText(c: Checks, repo: string, target: { pr: number } | { bra
   return `jobs: ${inline.map(j => `${j.name} ${j.url}`).join(' ; ')}${more > 0 ? ` ; +${more} more: ${list}` : ''}`;
 }
 
+/** Status line of a failure whose step count could not be read: why it is shown as an ordinary failure. */
+export const stepsUnread = (c: Checks): string | undefined =>
+  c.stepsError ? `step count of the failed jobs unread (${c.stepsError}): if they never started, there is no log` : undefined;
+
 /** What the agent probably does next for a PR in this state; omitted when nothing is actionable. */
 export function hint(s: Snapshot, repo: string): string | undefined {
   if (s.state !== 'OPEN') return undefined;
   if (s.mergeState === 'DIRTY') return 'merge the base branch into the head and resolve the conflict';
-  if (s.checks.state === 'fail') return failingLog(s.checks, repo, s.number);
+  if (s.checks.state === 'fail') return failingLog(s.checks, repo, s.head, s.number);
   if (s.mergeState === 'BEHIND') return 'update the branch with the base';
   if (s.mergeState === 'CLEAN' && !s.auto && !s.draft) return 'ready to merge';
   if (s.stallReported && s.missingRequired?.length) {

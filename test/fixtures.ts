@@ -23,6 +23,33 @@ export function commit(oid: string, checks: Check[] = [['test', 'COMPLETED', 'SU
   };
 }
 
+/**
+ * A GitHub Actions job as the rollup returns it. It carries three different identifiers: the check run's node id (`id`),
+ * and the workflow run and the job in its details link. Only the node id answers a step-count request.
+ */
+export interface Job { id: string; name: string; conclusion: string | null; run: number; job: number; status?: string }
+
+/** The check rollup of a head commit whose checks are these jobs: a branch head takes it as `statusCheckRollup`. */
+export const rollup = (list: Job[]) => ({ contexts: { nodes: list.map(j => ({
+  __typename: 'CheckRun', id: j.id, name: j.name, status: j.status ?? 'COMPLETED', conclusion: j.conclusion,
+  detailsUrl: `https://github.com/o/r/actions/runs/${j.run}/job/${j.job}`,
+})) } });
+/** The same for a pull request: `pr(n, { commits: jobsOf(list) })`. */
+export const jobsOf = (list: Job[]): RawPullRequest['commits'] => ({ nodes: [{ commit: { statusCheckRollup: rollup(list) } }] });
+
+/**
+ * The checks of a pull request whose jobs GitHub refused to start, in the shape it reports them: the workflow ran once
+ * for the push and once for the pull request, and in each run one matrix job ended FAILURE and its fail-fast sibling
+ * CANCELLED, neither running a step.
+ */
+export const REFUSED_JOBS: Job[] = [
+  { id: 'CR_ubuntu_pull', name: 'test (ubuntu-24.04)', conclusion: 'CANCELLED', run: 7702, job: 880021 },
+  { id: 'CR_ubuntu_push', name: 'test (ubuntu-24.04)', conclusion: 'CANCELLED', run: 7701, job: 880011 },
+  { id: 'CR_windows_pull', name: 'test (windows-latest)', conclusion: 'FAILURE', run: 7702, job: 880022 },
+  { id: 'CR_windows_push', name: 'test (windows-latest)', conclusion: 'FAILURE', run: 7701, job: 880012 },
+];
+export const running = (list: Job[]): Job[] => list.map(j => ({ ...j, status: 'IN_PROGRESS', conclusion: null }));
+
 /** A fake `gh api graphql`: serves the current PR table for the aliases and open list the query asks for. */
 export class FakeGitHub {
   prs = new Map<number, RawPullRequest>();
@@ -30,13 +57,22 @@ export class FakeGitHub {
   branches = new Map<string, RawCommit>();
   /** Branch name to the number of its open PR. */
   heads = new Map<string, number>();
+  /** Steps each check run executed, by its node id. An id not listed here comes back as a null node. */
+  steps = new Map<string, number>();
   calls: string[][] = [];
   fail?: string;
+  /** Fails only the step-count request; the repository request still answers. */
+  failSteps?: string;
   set(...items: RawPullRequest[]) { for (const p of items) this.prs.set(p.number, p); }
   run: Runner = async args => {
     this.calls.push(args);
     if (this.fail) throw new Error(this.fail);
     const query = args[args.indexOf('-f') + 1];
+    const ids = /nodes\(ids: \[(.*?)\]\)/.exec(query)?.[1];
+    if (ids !== undefined) {
+      if (this.failSteps) throw new Error(this.failSteps);
+      return JSON.stringify({ data: { nodes: (JSON.parse(`[${ids}]`) as string[]).map(id => (this.steps.has(id) ? { id, steps: { totalCount: this.steps.get(id) } } : null)) } });
+    }
     // Like GitHub: a fragment defined but never spread fails the whole request.
     if (query.includes('fragment F ') && !query.includes('...F')) throw new Error('gh: Fragment F was defined, but not used');
     const repository: Record<string, unknown> = {};
