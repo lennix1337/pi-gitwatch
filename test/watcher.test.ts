@@ -825,3 +825,17 @@ test('a network blip does not wake the agent; a network outage that lasts does, 
   gh.fail = undefined;
   assert.equal((await watcher.poll()).notices.length, 0);
 });
+
+test('an outage that starts as a network error and turns into an HTTP error is still announced', async () => {
+  const { gh, watcher } = setup();
+  gh.set(pr(1));
+  await watcher.watch('o/r');
+  gh.fail = 'dial tcp 4.228.31.149:443: connectex: A connection attempt failed';
+  const notices = [];
+  for (let i = 0; i < FAILURES_BEFORE_NOTICE + 1; i++) notices.push(...(await watcher.poll()).notices);
+  assert.equal(notices.length, 0);
+  gh.fail = 'HTTP 502';
+  notices.push(...(await watcher.poll()).notices);
+  notices.push(...(await watcher.poll()).notices);
+  assert.equal(notices.length, 1, 'the HTTP failure past its threshold is announced once');
+});

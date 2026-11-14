@@ -359,8 +359,9 @@ export class Watcher {
           if (isEmpty(watch) && !watch.held) delete state.repos[repo];
         } catch (error) {
           if (signal?.aborted) throw error;
+          const before = watch.failures ? noticeAfter(watch.lastError) : Infinity;
           watch.failures++; watch.lastError = error instanceof Error ? error.message : String(error);
-          if (watch.failures === noticeAfter(watch.lastError)) failed.push({ repo, failures: watch.failures, error: watch.lastError });
+          if (watch.failures >= noticeAfter(watch.lastError) && watch.failures - 1 < before) failed.push({ repo, failures: watch.failures, error: watch.lastError });
         }
       }
       if (failed.length) notices.push(this.failureNotice(failed, state.intervalSec));
