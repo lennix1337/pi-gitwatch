@@ -25,7 +25,7 @@ export const REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 export const BRANCH = /^[A-Za-z0-9._\/-]{1,200}$/;
 
 const ROLLUP = `statusCheckRollup { contexts(first: ${CONTEXTS_PAGE}) { nodes { __typename
-  ... on CheckRun { name status conclusion detailsUrl startedAt } ... on StatusContext { context state targetUrl createdAt } } } }`;
+  ... on CheckRun { id name status conclusion detailsUrl startedAt } ... on StatusContext { context state targetUrl createdAt } } } }`;
 const FIELDS = `number title url state isDraft mergeStateStatus reviewDecision headRefOid headRefName author { login } autoMergeRequest { enabledAt } mergeCommit { oid }
   commits(last: 1) { nodes { commit { ${ROLLUP} } } }
   baseRef { branchProtectionRule { requiredStatusCheckContexts }
@@ -69,6 +69,23 @@ export async function fetchRepo(run: Runner, repo: string, numbers: number[], op
     } else if (value) prs.set((value as RawPullRequest).number, value as RawPullRequest);
   }
   return { prs, open: openNumbers, branches: heads };
+}
+
+/**
+ * Asks how many steps each of these check runs executed, by node id. The rollup does not read it: there a step count is
+ * one more connection per check of every PR on every poll (52 rate-limit points instead of 2 for an open watch).
+ */
+export const stepsQuery = (ids: string[]) => `query { nodes(ids: [${ids.map(literal).join(', ')}]) { ... on CheckRun { id steps(first: 1) { totalCount } } } }`;
+
+/** The steps each of these check runs executed, in one request. A check run GitHub did not resolve has no entry. */
+export async function fetchSteps(run: Runner, ids: string[], signal?: AbortSignal): Promise<Map<string, number>> {
+  const out = await run(['api', 'graphql', '-f', `query=${stepsQuery(ids)}`], signal);
+  const parsed = JSON.parse(out) as { data?: { nodes?: ({ id?: string; steps?: { totalCount?: number } | null } | null)[] | null }; errors?: { message: string }[] };
+  const nodes = parsed.data?.nodes;
+  if (!nodes) throw new Error(parsed.errors?.map(e => e.message).join('; ').slice(0, 300) || 'no check runs returned');
+  const steps = new Map<string, number>();
+  for (const node of nodes) if (node?.id !== undefined && typeof node.steps?.totalCount === 'number') steps.set(node.id, node.steps.totalCount);
+  return steps;
 }
 
 /**
