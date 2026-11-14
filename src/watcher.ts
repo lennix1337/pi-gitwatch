@@ -58,6 +58,10 @@ export interface PollOptions {
 export const DEFAULT_INTERVAL_SEC = 30;
 /** Consecutive failed polls of one repository before the agent hears about it. */
 export const FAILURES_BEFORE_NOTICE = 3;
+/** A network error (timeout, reset, DNS) is usually a blip that heals itself: it needs this many failures (~10 min at 30 s) before it wakes the agent. */
+export const NETWORK_FAILURES_BEFORE_NOTICE = 20;
+const NETWORK_ERROR = /connectex|ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|timed out|i\/o timeout|network is unreachable/i;
+const noticeAfter = (error?: string) => error && NETWORK_ERROR.test(error) ? NETWORK_FAILURES_BEFORE_NOTICE : FAILURES_BEFORE_NOTICE;
 /** A candidate waits for a delivery at most this long, then goes out as a quiet notice (no model turn). */
 export const HELD_MAX_AGE_MS = 30 * 60_000;
 /** Held candidates kept per target; older ones past this cap are counted, not kept. */
@@ -333,7 +337,7 @@ export class Watcher {
         try {
           const { snapshots, open, branches } = settledValue(fetched[index]);
           const routed = [...advancePrs(watch, snapshots, open, this.now()), ...advanceBranches(watch, branches)];
-          if (watch.failures >= FAILURES_BEFORE_NOTICE) routed.push({ event: { pr: 0, kind: 'checks', text: `polling recovered after ${watch.failures} failures`, wake: false }, decision: { route: 'candidate', reason: 'quiet' } });
+          if (watch.failures >= noticeAfter(watch.lastError)) routed.push({ event: { pr: 0, kind: 'checks', text: `polling recovered after ${watch.failures} failures`, wake: false }, decision: { route: 'candidate', reason: 'quiet' } });
           watch.failures = 0; delete watch.lastError; watch.lastPoll = this.now();
           const shown = new Map(Object.values(watch.snapshots).map(s => [s.number, s]));
           const shownBranches = new Map(Object.entries(watch.branches ?? {}));
@@ -356,7 +360,7 @@ export class Watcher {
         } catch (error) {
           if (signal?.aborted) throw error;
           watch.failures++; watch.lastError = error instanceof Error ? error.message : String(error);
-          if (watch.failures === FAILURES_BEFORE_NOTICE) failed.push({ repo, failures: watch.failures, error: watch.lastError });
+          if (watch.failures === noticeAfter(watch.lastError)) failed.push({ repo, failures: watch.failures, error: watch.lastError });
         }
       }
       if (failed.length) notices.push(this.failureNotice(failed, state.intervalSec));
