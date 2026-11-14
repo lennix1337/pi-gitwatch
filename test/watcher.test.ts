@@ -6,7 +6,7 @@ import { gitRunner } from '../src/autowatch.ts';
 import { cleanupLines } from '../src/cleanup.ts';
 import { type Runner, fetchSteps, query, stepsQuery } from '../src/github.ts';
 import type { RawPullRequest } from '../src/model.ts';
-import { FAILURES_BEFORE_NOTICE, statusText, Store, Watcher, watchPush } from '../src/watcher.ts';
+import { FAILURES_BEFORE_NOTICE, NETWORK_FAILURES_BEFORE_NOTICE, statusText, Store, Watcher, watchPush } from '../src/watcher.ts';
 import { commit, FakeGitHub, gitWorld, jobsOf, pr, REFUSED_JOBS, rollup, run, running, tempDir, type Job } from './fixtures.ts';
 
 const setup = () => {
@@ -809,4 +809,33 @@ test('a merge that was not queued with auto-merge (someone merged it) still wake
 test('a merge without a known clone wakes: nothing was cleaned or fast-forwarded', async () => {
   const { notices } = await mergedAfterQueue([], { clone: null });
   assert.deepEqual(notices.map(n => n.wake), [true]);
+});
+
+test('a network blip does not wake the agent; a network outage that lasts does, once', async () => {
+  const { gh, watcher } = setup();
+  gh.set(pr(1));
+  await watcher.watch('o/r');
+  gh.fail = 'Post "https://api.github.com/graphql": dial tcp 4.228.31.149:443: connectex: A connection attempt failed';
+  const notices = [];
+  for (let i = 0; i < NETWORK_FAILURES_BEFORE_NOTICE - 1; i++) notices.push(...(await watcher.poll()).notices);
+  assert.equal(notices.length, 0, 'a few minutes of network trouble is not news');
+  notices.push(...(await watcher.poll()).notices);
+  assert.equal(notices.length, 1, 'the outage that lasts is announced');
+  assert.match(notices[0].text, new RegExp(`Polling failed ${NETWORK_FAILURES_BEFORE_NOTICE} times in a row`));
+  gh.fail = undefined;
+  assert.equal((await watcher.poll()).notices.length, 0);
+});
+
+test('an outage that starts as a network error and turns into an HTTP error is still announced', async () => {
+  const { gh, watcher } = setup();
+  gh.set(pr(1));
+  await watcher.watch('o/r');
+  gh.fail = 'dial tcp 4.228.31.149:443: connectex: A connection attempt failed';
+  const notices = [];
+  for (let i = 0; i < FAILURES_BEFORE_NOTICE + 1; i++) notices.push(...(await watcher.poll()).notices);
+  assert.equal(notices.length, 0);
+  gh.fail = 'HTTP 502';
+  notices.push(...(await watcher.poll()).notices);
+  notices.push(...(await watcher.poll()).notices);
+  assert.equal(notices.length, 1, 'the HTTP failure past its threshold is announced once');
 });
