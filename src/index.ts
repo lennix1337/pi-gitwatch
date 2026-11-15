@@ -186,6 +186,8 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
   const start = () => { if (interactive && loop.phase === 'stopped') wait(1000, epoch); };
   const stop = () => {
     epoch++;
+    // Pi throws from a ctx whose session was reloaded or replaced; a poll still in flight must not reach it.
+    warn = undefined;
     if (loop.phase === 'waiting') cancel(loop.timer);
     move({ phase: 'stopped' });
     lease.release();

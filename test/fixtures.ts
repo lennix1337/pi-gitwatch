@@ -61,11 +61,14 @@ export class FakeGitHub {
   steps = new Map<string, number>();
   calls: string[][] = [];
   fail?: string;
+  /** Holds every request until it settles, to act while a poll is in flight. */
+  hold?: Promise<void>;
   /** Fails only the step-count request; the repository request still answers. */
   failSteps?: string;
   set(...items: RawPullRequest[]) { for (const p of items) this.prs.set(p.number, p); }
   run: Runner = async args => {
     this.calls.push(args);
+    await this.hold;
     if (this.fail) throw new Error(this.fail);
     const query = args[args.indexOf('-f') + 1];
     const ids = /nodes\(ids: \[(.*?)\]\)/.exec(query)?.[1];
