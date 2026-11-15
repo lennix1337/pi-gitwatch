@@ -550,3 +550,26 @@ test('a session without a UI gets the same quiet message as one with a UI', asyn
   assert.equal(h.sent[0].message.display, true);
   assert.equal(h.shown.length, 0);
 });
+
+test('a poll still running when the session reloads never touches the old session ui', async () => {
+  const h = harness();
+  h.gh.set(pr(1));
+  await h.call({ action: 'watch', repo: 'o/r' });
+  // Pi throws from ctx.ui once the session that gave the ctx was replaced or reloaded.
+  let stale = false;
+  const ctx = { mode: 'tui', hasUI: true, get ui() { if (stale) throw new Error('This extension ctx is stale'); return { notify: () => {} }; } };
+  h.handlers.get('session_shutdown')!({}, { mode: 'tui' });
+  h.handlers.get('session_start')!({}, ctx);
+  let release!: () => void;
+  h.gh.hold = new Promise<void>(r => { release = r; });
+  h.gh.fail = 'network down';
+  requestFollow(h.dir, { repo: 'o/r', pr: 2 });
+  const poll = h.timers.pop()!();
+  const scheduled = h.timers.length;
+  await new Promise(r => setImmediate(r));
+  h.handlers.get('session_shutdown')!({}, { mode: 'tui' });
+  stale = true;
+  release();
+  await poll;
+  assert.equal(h.timers.length, scheduled, 'the stopped loop schedules nothing');
+});
