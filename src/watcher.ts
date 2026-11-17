@@ -566,6 +566,9 @@ function advancePrs(watch: RepoWatch, snapshots: Map<number, Snapshot>, open: nu
     const cur = snapshots.get(n);
     if (watch.ignore?.includes(n) || !cur) continue;
     const prev = watch.snapshots[n];
+    // A PR that reads CLOSED may be a merge GitHub has not recorded yet (Genexus18MCP #1044, auto-merge): keep the open
+    // snapshot for one poll and report what the next poll reads, merged or still closed.
+    if (prev?.state === 'OPEN' && cur.state === 'CLOSED' && !prev.closing) { watch.snapshots[n] = { ...prev, closing: true }; continue; }
     const { snapshot, event: stall } = autoMergeStall(prev, settle(prev, cur), now);
     let next = snapshot;
     if (prev || watch.mode === 'open') {

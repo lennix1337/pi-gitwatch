@@ -35,6 +35,11 @@ export interface Snapshot {
   /** When checks were first seen passing on this head with auto-merge on, and whether the stall was reported. */
   passedAt?: number; stallReported?: boolean;
   /**
+   * Set on the stored open snapshot of a PR that read CLOSED once: GitHub can show a PR closed for a moment while its merge
+   * (auto-merge included) is still being recorded, so the close is reported only when the next poll still reads it.
+   */
+  closing?: boolean;
+  /**
    * Checks the base branch requires that have no run on the head at all, as when GitHub never created a workflow's
    * final job: auto-merge then waits forever with every listed check green. Absent when all reported or none is known.
    */
