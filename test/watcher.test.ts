@@ -102,6 +102,53 @@ test('a PR added to an open watch is forgotten after its merge, not announced as
   assert.equal(watcher.state().repos['o/r'].held, undefined);
 });
 
+test('a PR read as closed before its merge is visible is announced as merged, never as closed (Genexus18MCP #1044)', async () => {
+  const { gh, watcher, tick } = setup();
+  gh.set(pr(1044, { autoMergeRequest: {} }));
+  await watcher.watch('o/r', { prs: [1044] });
+  tick();
+  gh.set(pr(1044, { state: 'CLOSED', autoMergeRequest: {} }));
+  const early = await watcher.poll();
+  assert.deepEqual(early.events.get('o/r'), [], 'a close is confirmed one poll before it is reported');
+  assert.equal(early.notices.length, 0);
+  tick();
+  gh.set(pr(1044, { state: 'MERGED', autoMergeRequest: {}, mergeCommit: { oid: '6b21b02c95fd' } }));
+  const merged = await watcher.poll();
+  assert.deepEqual(merged.events.get('o/r')!.map(e => [e.pr, e.kind]), [[1044, 'merged']]);
+  assert.doesNotMatch(merged.notices.map(n => n.text).join('\n'), /closed without merge/);
+});
+
+test('a PR closed without merge is still reported as closed once the close is confirmed', async () => {
+  const { gh, watcher, tick } = setup();
+  gh.set(pr(1), pr(2));
+  await watcher.watch('o/r', { prs: [1, 2] });
+  tick();
+  gh.set(pr(1, { state: 'CLOSED' }), pr(2));
+  assert.deepEqual((await watcher.poll()).events.get('o/r'), []);
+  tick();
+  const confirmed = await watcher.poll();
+  assert.deepEqual(confirmed.events.get('o/r')!.map(e => [e.pr, e.kind, e.wake]), [[1, 'closed', true]]);
+  assert.match(confirmed.notices[0].text, /#1 closed without merge/);
+  assert.deepEqual(watcher.state().repos['o/r'].prs, [2], 'the closed PR leaves the watch list');
+  tick();
+  assert.deepEqual((await watcher.poll()).events.get('o/r'), [], 'reported once');
+});
+
+test('a PR that reads closed once and then open again is not reported', async () => {
+  const { gh, watcher, tick } = setup();
+  gh.set(pr(1));
+  await watcher.watch('o/r', { prs: [1] });
+  tick();
+  gh.set(pr(1, { state: 'CLOSED' }));
+  await watcher.poll();
+  tick();
+  gh.set(pr(1));
+  assert.deepEqual((await watcher.poll()).events.get('o/r'), []);
+  tick();
+  gh.set(pr(1, { state: 'CLOSED' }));
+  assert.deepEqual((await watcher.poll()).events.get('o/r'), [], 'a later close is confirmed again');
+});
+
 test('a closed PR seen for the first time is not announced as opened', async () => {
   const { gh, watcher } = setup();
   gh.set(pr(1));

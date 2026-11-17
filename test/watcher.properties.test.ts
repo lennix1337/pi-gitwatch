@@ -94,6 +94,8 @@ class Oracle {
   readonly obs = new Map<number, Obs>();
   readonly told = new Map<number, Told>();
   readonly episode = new Map<number, Episode>();
+  /** PRs read as closed once and awaiting the confirming poll. */
+  readonly closing = new Set<number>();
   constructor(readonly truth: Map<number, Truth>) {
     PRS.forEach(n => this.obs.set(n, observe(truth.get(n)!)));
   }
@@ -114,8 +116,10 @@ class Oracle {
       const prev = this.obs.get(n);
       if (!prev) continue;
       const t = this.truth.get(n)!;
+      // A close is confirmed by a second poll before it is reported, as GitHub may show a merge as closed first.
+      if (t.terminal === 'CLOSED' && !this.closing.has(n)) { this.closing.add(n); continue; }
       if (t.terminal) {
-        // A merge or a close always wakes; the PR is then no longer followed.
+        // A merge or a confirmed close always wakes; the PR is then no longer followed.
         responds++; ended.push(n);
         this.obs.delete(n); this.episode.delete(n);
         continue;
