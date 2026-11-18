@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 import { AUTO_MERGE_STALL_MS, autoMergeStall, branchDiff, branchHint, branchLine, diff, hint, jobsText, line, normalize, normalizeBranch, settle, summarizeChecks, type WatchEvent } from '../src/model.ts';
 import { announce, handledMerge, routeEvent } from '../src/route.ts';
@@ -223,6 +226,25 @@ test('jobs GitHub never started are told apart from a failure: the event says no
   assert.deepEqual(pushed.events.map(e => [e.wake, e.text]), [[true, NEVER_STARTED]], 'the CI of a direct push says the same');
   assert.equal(branchHint(pushed.snapshot, 'o/r'), validateLocally('c0ffee00'));
   assert.match(branchLine(pushed.snapshot), /^main @c0ffee00 · checks never started 0✓ 2✗ 0…/);
+});
+
+test('a repository with a local gate in local-gates.json gets that command in the never-started next step; a branch skips a command that needs a PR', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'gitwatch-gates-'));
+  const saved = process.env.PI_GITWATCH_DIR;
+  process.env.PI_GITWATCH_DIR = dir;
+  try {
+    writeFileSync(join(dir, 'local-gates.json'), JSON.stringify({ 'o/r': 'node ship.mjs {pr} --head {head}', 'o/other': 'x' }));
+    const refused = normalize(pr(6, { mergeStateStatus: 'UNSTABLE', commits: jobsOf(REFUSED_JOBS) }), new Map(REFUSED_JOBS.map(j => [j.id, 0])));
+    assert.equal(hint(refused, 'o/r'), validateLocally('6aaaaaaa').replace('locally and', 'locally with: node ship.mjs 6 --head 6aaaaaaa and'));
+    const head = { ...commit('c0ffee'), statusCheckRollup: rollup(REFUSED_JOBS) };
+    const pushed = branchDiff(normalizeBranch('main', { ...head, statusCheckRollup: rollup(running(REFUSED_JOBS)) }), normalizeBranch('main', head, new Map(REFUSED_JOBS.map(j => [j.id, 0]))));
+    assert.equal(branchHint(pushed.snapshot, 'o/r'), validateLocally('c0ffee00'), 'no PR to fill in: the plain text stays');
+    writeFileSync(join(dir, 'local-gates.json'), '{broken');
+    assert.equal(hint(refused, 'o/r'), validateLocally('6aaaaaaa'), 'an unreadable file changes nothing');
+  } finally {
+    if (saved === undefined) delete process.env.PI_GITWATCH_DIR; else process.env.PI_GITWATCH_DIR = saved;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('a failure is called never started only when every failed job is an Actions job that ran no step; anything else keeps the failure and its log command', () => {

@@ -1,4 +1,5 @@
 /** GitHub pull-request state reduced to the fields that decide what to do next, and the transitions worth reporting. */
+import { localGate } from './local-gates.ts';
 
 export type ChecksState = 'none' | 'pending' | 'pass' | 'fail';
 /** A failing check with the link to its job (or external status), so a notice can name it without a query. */
@@ -279,7 +280,10 @@ export function branchDiff(prev: BranchSnapshot | undefined, cur: BranchSnapshot
  * page, which carries GitHub's reason as an annotation.
  */
 function failingLog(c: Checks, repo: string, head: string, pr?: number): string {
-  if (c.neverStarted) return `validate ${head} locally and treat that result as the gate: no job ran a step, so there is no log (typically billing or a spending limit). GitHub's reason: gh run view ${c.runs[0]} --repo ${repo}`;
+  if (c.neverStarted) {
+    const gate = localGate(repo, head, pr);
+    return `validate ${head} locally${gate ? ` with: ${gate}` : ''} and treat that result as the gate: no job ran a step, so there is no log (typically billing or a spending limit). GitHub's reason: gh run view ${c.runs[0]} --repo ${repo}`;
+  }
   if (c.runs.length) return `read the failing job log: ${c.runs.slice(0, 3).map(id => `gh run view ${id} --repo ${repo} --log-failed`).join(' ; ')}`;
   return pr ? `read the failing job log: gh pr checks ${pr} --repo ${repo}` : 'open the failing check on GitHub';
 }
