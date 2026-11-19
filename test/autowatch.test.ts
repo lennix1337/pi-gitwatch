@@ -91,6 +91,7 @@ test('a gh pr merge that merges now is an own merge; a queued one (--auto), a dr
   assert.deepEqual(ownMerges('gh pr merge 12 -R o/r -t "merge 9"', '/x'), [{ pr: 12, repo: 'o/r', dir: '/x' }], 'a value after -t is not a PR');
   assert.deepEqual(ownMerges('gh pr merge 12 --auto --repo o/r', '/x'), [], 'auto-merge only queues the merge');
   assert.deepEqual(ownMerges('gh pr merge 9 -R o/r | head -1 || true', '/x', 'GraphQL: Could not resolve to a PullRequest with the number of 9.'), [], 'a failed merge hidden by a pipe is not an own merge');
+  assert.deepEqual(ownMerges('gh pr merge 9 -R o/r | head -1', '/x', '! Pull request o/r#9 was already merged'), [], 'a PR that was already merged is not merged now: no merged event will clear it');
   assert.deepEqual(ownMerges('gh pr merge 9 -R o/r; echo rc=$?', '/x', 'Not run: PR 9 is not mergeable over green CI'), [], 'a refused merge is not an own merge');
   assert.deepEqual(ownMerges('gh pr merge 9 -R o/r', '/x', ''), [{ pr: 9, repo: 'o/r', dir: '/x' }], 'a silent success (gh prints nothing off a tty) still counts');
   assert.deepEqual(ownMerges('gh pr merge 430 --disable-auto', '/x'), [], 'turning auto-merge off merges nothing: the later merge must still be announced');
