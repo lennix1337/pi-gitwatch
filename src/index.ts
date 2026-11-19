@@ -284,7 +284,8 @@ export async function noteOwnMerges(event: BashResult, watcher: Watcher, git: Gi
   if (event.toolName !== 'bash' || event.isError) return;
   const command = typeof event.input.command === 'string' ? event.input.command : '';
   if (!/\bgh\s+pr\s+merge\b/.test(command)) return;
-  for (const merge of ownMerges(command, cwd)) {
+  const output = event.content.flatMap(c => c.type === 'text' ? [c.text] : []).join('\n');
+  for (const merge of ownMerges(command, cwd, output)) {
     // A clone without an origin remote names no GitHub repository: there is nothing to record.
     const repo = merge.repo ?? githubRepo(await git(['remote', 'get-url', 'origin'], merge.dir).catch(() => ''));
     if (repo) await watcher.noteOwnMerge(repo, merge.pr);
