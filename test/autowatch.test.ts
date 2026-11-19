@@ -90,6 +90,7 @@ test('a gh pr merge that merges now is an own merge; a queued one (--auto), a dr
   assert.deepEqual(ownMerges('gh pr merge https://github.com/o/r/pull/7 --squash', '/x'), [{ pr: 7, repo: 'o/r', dir: '/x' }], 'a PR URL names its repository');
   assert.deepEqual(ownMerges('gh pr merge 12 -R o/r -t "merge 9"', '/x'), [{ pr: 12, repo: 'o/r', dir: '/x' }], 'a value after -t is not a PR');
   assert.deepEqual(ownMerges('gh pr merge 12 --auto --repo o/r', '/x'), [], 'auto-merge only queues the merge');
+  assert.deepEqual(ownMerges('gh pr merge 430 --disable-auto', '/x'), [], 'turning auto-merge off merges nothing: the later merge must still be announced');
   assert.deepEqual(ownMerges('echo gh pr merge 12', '/x'), [], 'a word inside another command is not a merge');
   assert.deepEqual(ownMerges('gh pr merge --squash', '/x'), [], 'no PR named: nothing is recorded');
   assert.deepEqual(ownMerges('gh pr merge 3 && gh pr merge 4 --auto', '/x'), [{ pr: 3, dir: '/x' }], 'each command of a chain is read');
