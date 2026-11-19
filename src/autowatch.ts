@@ -84,7 +84,8 @@ export interface OwnMerge { pr: number; repo?: string; dir: string }
 const MERGE_WITH_VALUE = new Set(['-b', '--body', '-F', '--body-file', '-t', '--subject', '-A', '--author-email', '--match-head-commit']);
 
 /**
- * The PRs a shell command merged right now with `gh pr merge`; `--auto` is skipped because it only queues the merge.
+ * The PRs a shell command merged right now with `gh pr merge`; `--auto` is skipped because it only queues the merge,
+ * and `--disable-auto` because it only cancels one (recording it would silence the real merge later).
  * A merge made through the web or another tool is not seen here.
  */
 export function ownMerges(command: string, cwd: string): OwnMerge[] {
@@ -97,7 +98,7 @@ export function ownMerges(command: string, cwd: string): OwnMerge[] {
     let auto = false, flagRepo: string | undefined, target: string | undefined;
     for (let i = 3; i < words.length; i++) {
       const w = words[i];
-      if (w === '--auto') auto = true;
+      if (w === '--auto' || w === '--disable-auto') auto = true;
       else if (w === '-R' || w === '--repo') flagRepo = words[++i];
       else if (w.startsWith('--repo=')) flagRepo = w.slice('--repo='.length);
       else if (MERGE_WITH_VALUE.has(w)) i++;
