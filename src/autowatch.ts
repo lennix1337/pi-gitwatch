@@ -81,7 +81,7 @@ export function pushes(command: string, cwd: string): Push[] {
 /** A PR a shell command merged with `gh pr merge` (not queued with `--auto`), the repository it names, and where it ran. */
 export interface OwnMerge { pr: number; repo?: string; dir: string }
 /** What gh prints when a merge did not happen (unknown PR, failing checks, a blocked merge, or a refused call). */
-const MERGE_FAILED = /GraphQL:|Pull request #?\d+ is not mergeable|\bNot run:|^X |failed to |could not /im;
+const MERGE_FAILED = /GraphQL:|Pull request #?\d+ is not mergeable|\bNot run:|^X |failed to |could not |was already merged|is closed/im;
 /** `gh pr merge` options that take a value, so the value is not read as the PR. */
 const MERGE_WITH_VALUE = new Set(['-b', '--body', '-F', '--body-file', '-t', '--subject', '-A', '--author-email', '--match-head-commit']);
 
