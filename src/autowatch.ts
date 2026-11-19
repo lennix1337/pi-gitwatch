@@ -80,6 +80,8 @@ export function pushes(command: string, cwd: string): Push[] {
 
 /** A PR a shell command merged with `gh pr merge` (not queued with `--auto`), the repository it names, and where it ran. */
 export interface OwnMerge { pr: number; repo?: string; dir: string }
+/** What gh prints when a merge did not happen (unknown PR, failing checks, a blocked merge, or a refused call). */
+const MERGE_FAILED = /GraphQL:|Pull request #?\d+ is not mergeable|\bNot run:|^X |failed to |could not /im;
 /** `gh pr merge` options that take a value, so the value is not read as the PR. */
 const MERGE_WITH_VALUE = new Set(['-b', '--body', '-F', '--body-file', '-t', '--subject', '-A', '--author-email', '--match-head-commit']);
 
@@ -88,7 +90,9 @@ const MERGE_WITH_VALUE = new Set(['-b', '--body', '-F', '--body-file', '-t', '--
  * and `--disable-auto` because it only cancels one (recording it would silence the real merge later).
  * A merge made through the web or another tool is not seen here.
  */
-export function ownMerges(command: string, cwd: string): OwnMerge[] {
+export function ownMerges(command: string, cwd: string, output = ''): OwnMerge[] {
+  // `gh pr merge ... | head`, `; echo rc=$?` and `|| true` hide a failed merge from the tool's exit status; gh's own error says it.
+  if (MERGE_FAILED.test(output)) return [];
   const found: OwnMerge[] = [];
   let dir = cwd;
   for (const segment of segments(command)) {
