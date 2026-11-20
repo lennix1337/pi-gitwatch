@@ -151,6 +151,7 @@ export function noticeText(repo: string, events: WatchEvent[], snapshots: Map<nu
 
 /** Where an event's notice goes: the subscriber of its PR or branch when there is one, else this session (`main`). */
 function targetOf(watch: RepoWatch, e: WatchEvent): string {
+  if (e.kind === 'merged' || e.kind === 'closed' || e.kind === 'cleanup') return 'main';
   const label = e.branch !== undefined ? watch.subscribers?.[`branch:${e.branch}`] : e.pr > 0 ? watch.subscribers?.[`pr:${e.pr}`] : undefined;
   return label ? `sub:${label}` : 'main';
 }

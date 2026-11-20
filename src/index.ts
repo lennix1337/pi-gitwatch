@@ -165,7 +165,7 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
           try {
             // A script that names no clone (older ship.mjs) still pushed from a checkout of the repository: a loaded Pi package is the one we can find.
             const clone = request.clone ?? (watcher.state().repos[request.repo]?.clone ? undefined : await packageClone(request.repo, packages(), git));
-            await watcher.watch(request.repo, { prs: [request.pr], ...clone ? { clone } : {} });
+            await watcher.watch(request.repo, { prs: [request.pr], ...clone ? { clone } : {}, ...request.subscriber ? { subscriber: request.subscriber } : {} });
             done();
           }
           catch (error) {
