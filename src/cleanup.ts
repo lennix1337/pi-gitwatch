@@ -1,4 +1,5 @@
 import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import type { GitRunner } from './autowatch.ts';
 import { isLoadedPackage } from './packages.ts';
 
@@ -137,16 +138,17 @@ export async function cleanupLines(git: GitRunner, notice: { clone?: string; eve
   if (!notice.clone) return [];
   const merged = notice.events.filter(e => e.kind === 'merged' && e.head);
   if (!merged.length) return [];
-  if (!existsSync(notice.clone)) return merged.map(e => ({ pr: e.pr, text: `cleanup skipped: ${notice.clone} no longer exists, so its main checkout was not updated`, left: true as const }));
+  const clone = existsSync(notice.clone) ? notice.clone : survivingMain(notice.clone);
+  if (!clone) return merged.map(e => ({ pr: e.pr, text: `cleanup skipped: ${notice.clone} no longer exists, so its main checkout was not updated`, left: true as const }));
   // Found first: removing a merged linked worktree may delete the folder this clone names.
-  const main = await mainCheckout(git, notice.clone);
+  const main = await mainCheckout(git, clone);
   const lines: CleanupLine[] = [];
   // One checkout-level result per poll is filed under the last merged PR, as the fast-forward is.
   const pr = merged[merged.length - 1].pr;
   for (const text of await switchMergedBranch(git, main, merged.map(e => e.head!)) ?? []) lines.push({ pr, text });
   for (const e of merged) {
     try {
-      for (const text of await cleanMerged(git, notice.clone, e.head!)) lines.push({ pr: e.pr, text, ...text.startsWith('removed ') || STAYS_QUIET.test(text) ? {} : { left: true as const } });
+      for (const text of await cleanMerged(git, clone, e.head!)) lines.push({ pr: e.pr, text, ...text.startsWith('removed ') || STAYS_QUIET.test(text) ? {} : { left: true as const } });
     } catch (error) { lines.push({ pr: e.pr, text: `cleanup skipped: ${lastLine(error)}`, left: true }); }
   }
   // The checkout to update and to reload is the main one, whichever linked worktree the push came from.
@@ -154,6 +156,12 @@ export async function cleanupLines(git: GitRunner, notice: { clone?: string; eve
   if (forward) lines.push({ pr, ...forward });
   if (isLoadedPackage(main, options.packages ?? [])) lines.push({ pr, text: `reload needed: ${main} is a loaded Pi package`, left: true });
   return lines;
+}
+
+/** The repository a removed linked worktree (`<repo>/worktrees/<name>` or `<repo>/.worktrees/<name>`) belonged to, when it still exists. */
+function survivingMain(clone: string): string | undefined {
+  const match = /^(.*?)[\\/]\.?worktrees[\\/][^\\/]+/.exec(clone);
+  return match && existsSync(join(match[1], '.git')) ? match[1] : undefined;
 }
 
 /** The main worktree of the repository `clone` belongs to; `clone` itself when git cannot say. */

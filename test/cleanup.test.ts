@@ -82,10 +82,18 @@ test('a branch checked out in the main worktree is only reported: the notice lis
   assert.equal(kept.left, undefined);
 });
 
-test('a clone the agent already removed is one clear left line, not a "spawn git ENOENT" note', async () => {
-  const { dir, head } = repo();
+test('a clone the agent already removed, inside its repository, is cleaned from the main checkout', async () => {
+  const { dir, head, git } = repo();
   const gone = join(dir, 'worktrees', 'already-removed');
   const lines = await cleanupLines(gitRunner, { clone: gone, events: [{ kind: 'merged', pr: 4, head }] });
+  assert.ok(lines.some(l => l.text.startsWith('removed branch done')), lines.map(l => l.text).join(', '));
+  assert.ok(!lines.some(l => /no longer exists/.test(l.text)));
+  assert.equal(git('branch', '--list', 'done'), '');
+});
+
+test('a clone that is gone and not inside a repository is one clear left line, not a "spawn git ENOENT" note', async () => {
+  const gone = join(tempDir(), 'elsewhere');
+  const lines = await cleanupLines(gitRunner, { clone: gone, events: [{ kind: 'merged', pr: 4, head: 'abc' }] });
   assert.equal(lines.length, 1);
   assert.match(lines[0].text, /^cleanup skipped: .* no longer exists/);
   assert.equal(lines[0].left, true);
