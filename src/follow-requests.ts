@@ -1,6 +1,7 @@
 import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { REPO } from './github.ts';
+import { SUBSCRIBER } from './subscribers.ts';
 
 /**
  * PRs another process asks the poller to follow, one JSON file each in `<state dir>/follow/`. A script that opens a PR
@@ -11,9 +12,12 @@ export interface FollowRequest {
   repo: string; pr: number;
   /** The checkout the PR was pushed from (a linked worktree is fine): where its merged branches are cleaned afterwards. */
   clone?: string;
+  /** Worker run that should receive this PR's notices. */
+  subscriber?: string;
 }
 
 const folder = (dir: string) => join(dir, 'follow');
+const subscriberOf = (value: unknown): string | undefined => typeof value === 'string' && SUBSCRIBER.test(value) ? value : undefined;
 
 /** Drops a request for the poller; safe from any process (written to a temp name, then renamed). */
 export function requestFollow(dir: string, request: FollowRequest) {
@@ -35,7 +39,8 @@ export function pendingFollows(dir: string): { request: FollowRequest; done: () 
     try {
       const r = JSON.parse(readFileSync(file, 'utf8')) as Partial<FollowRequest>;
       if (typeof r.repo === 'string' && REPO.test(r.repo) && Number.isInteger(r.pr) && r.pr! > 0) {
-        found.push({ request: { repo: r.repo, pr: r.pr!, ...typeof r.clone === 'string' && r.clone ? { clone: r.clone } : {} }, done });
+        const subscriber = subscriberOf(r.subscriber);
+        found.push({ request: { repo: r.repo, pr: r.pr!, ...typeof r.clone === 'string' && r.clone ? { clone: r.clone } : {}, ...subscriber ? { subscriber } : {} }, done });
       }
       else done();
     } catch { done(); }

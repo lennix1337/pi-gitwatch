@@ -214,6 +214,25 @@ test('a successful push or gh pr create in bash starts a watch and says so in th
   assert.equal(await child.handlers.get('tool_result')!({ toolName: 'bash', input: { command: 'git push' }, content: [], isError: false }, { mode: 'json' }), undefined, 'a non-polling session never watches');
 });
 
+test('a worker follow request routes failed CI to its subscriber and the merge to the manager', async () => {
+  const h = harness();
+  const taken: SubscriberNotice[] = [];
+  h.events.on(SUBSCRIBER_NOTICE_CHANNEL, data => { const notice = data as SubscriberNotice; taken.push(notice); notice.accept(); });
+  h.gh.set(pr(33, {}, [['test', 'IN_PROGRESS']]));
+  requestFollow(h.dir, { repo: 'o/r', pr: 33, subscriber: 'worker-1' });
+  await h.fire();
+  h.gh.set(pr(33, {}, [['test', 'COMPLETED', 'FAILURE']]));
+  await h.fire();
+  assert.equal(taken.length, 1);
+  assert.equal(taken[0].subscriber, 'worker-1');
+  assert.match(taken[0].text, /#33 checks failed/);
+  assert.equal(h.sent.length, 0);
+  h.gh.set(pr(33, { state: 'MERGED', mergeCommit: { oid: 'cf5d0033aaaa' } }));
+  await h.fire();
+  assert.equal(h.sent.length, 1);
+  assert.match(h.sent[0].message.content, /#33 merged/);
+});
+
 test('a PR another process asks to follow (ship.mjs, a background shell) is followed and its merge wakes the agent', async () => {
   const h = harness();
   h.gh.set(pr(32, { autoMergeRequest: {} }, [['test', 'IN_PROGRESS']]));
