@@ -51,8 +51,8 @@ test('a new watch is a silent baseline; a finished check wakes once', async () =
   const { notices } = await watcher.poll();
   assert.equal(notices.length, 1);
   assert.match(notices[0].text, /^\[gitwatch\] o\/r · 13:50\n#750 checks passed 1\/1\n  #750 BLOCKED/);
-  // The notice arrives as a user message: a bare "grants no permission" was logged by the memory compactor as the operator
-  // forbidding merges, so the footer says whose words these are and that it withdraws nothing either.
+
+
   assert.match(notices[0].text, /not the operator's words/);
   assert.match(notices[0].text, /neither grants nor withdraws permission/);
   assert.match(notices[0].text, /standing rules or an earlier operator order cover the next step/);
@@ -285,10 +285,7 @@ test('the clone a push came from rides on the merge notice with the merged head,
   assert.deepEqual(notices[0].events.filter(e => e.kind === 'merged').map(e => e.head), ['5aaaaaaa'], 'the short head a snapshot keeps; git resolves it');
 });
 
-/**
- * A runner that holds each GitHub read until `expected` of them are in flight (or a second passes), then answers like
- * FakeGitHub. A sequential poll never gets `expected` reads in flight, so its peak stays at one.
- */
+
 function barrierRunner(gh: FakeGitHub, expected: number) {
   let inFlight = 0, peak = 0;
   const calls: string[][] = [];
@@ -361,7 +358,7 @@ test('a failing repository is counted on its own while the others in the same po
   assert.equal(watcher.state().repos['o/bad'].failures, FAILURES_BEFORE_NOTICE);
 });
 
-/** A PR whose checks carry job links, as GitHub's rollup gives them: each job has its own run and job id. */
+
 const jobsPr = (n: number, over: Partial<RawPullRequest>, jobs: { name: string; status: string; conclusion: string | null; run: number; job: number }[]) => pr(n, {
   ...over,
   commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: jobs.map(j => ({ __typename: 'CheckRun', name: j.name, status: j.status, conclusion: j.conclusion, detailsUrl: `https://github.com/o/r/actions/runs/${j.run}/job/${j.job}` })) } } } }] },
@@ -380,7 +377,7 @@ test('a failing check names its job links in the notice, and status keeps them',
   assert.match(statusText(watcher.state(), new Map(), 'o/r', 0), /jobs: e2e https:\/\/github\.com\/o\/r\/actions\/runs\/61\/job\/4/);
 });
 
-/** A watched PR #6 whose jobs are running; `finish` ends them the way GitHub ended the refused ones and counts the gh calls of the next poll. */
+
 const refusedPr = async () => {
   const { gh, watcher, tick } = setup();
   gh.set(pr(6, { commits: jobsOf(running(REFUSED_JOBS)) }));
@@ -413,7 +410,7 @@ test('a failure whose jobs ran steps is announced as a failure with its log comm
   assert.match(notices[0].text, /next: read the failing job log: gh run view 7701 --repo o\/r --log-failed ; gh run view 7702 --repo o\/r --log-failed/);
   assert.deepEqual(await poll(), { notices: [], calls: 1 });
 
-  // A commit status failing next to a job reported from somewhere else: the failure is real whatever the job did.
+
   const lint: Job = { id: 'CR_lint', name: 'lint', conclusion: 'FAILURE', run: 7703, job: 880031 };
   const external = (state: string) => ({ __typename: 'StatusContext', context: 'ci/external', state, targetUrl: 'https://ci.example/1' });
   const mixed = (jobs: Job[], state: string) => pr(7, { commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: [...rollup(jobs).contexts.nodes, external(state)] } } } }] } });
@@ -723,7 +720,7 @@ test('a PR that merged between polls is still announced when it is followed agai
   assert.match(notices.map(n => n.text).join('\n'), /#5 merged abcdef12/, 'the merge is not dropped by the re-watch');
 });
 
-/** A queued auto-merge PR watched with a clone, then merged: the poll that sees the merge, with `cleanup` answering. */
+
 async function mergedAfterQueue(lines: { text: string; left?: true }[] | 'throws', over: { auto?: boolean; clone?: string | null } = {}) {
   const { gh, watcher, tick } = setup();
   const auto = over.auto ?? true;
@@ -762,7 +759,7 @@ test('a merge wakes when the cleanup left something only the agent can fix: unco
   assert.match(notices[0].text, /skipped fast-forward of \/work\/main/);
 });
 
-/** An auto-merge of PR 90 followed from `clone` of a real repository, cleaned by the real `cleanupLines`; `packages` are the loaded Pi packages. */
+
 async function mergedWithRealCleanup(clone: string, over: { auto?: boolean; packages?: string[]; head?: string } = {}) {
   const { gh, watcher, tick } = setup();
   gh.set(pr(90, { ...over.auto === false ? {} : { autoMergeRequest: {} }, headRefOid: (over.head ?? 'deadbeef').padEnd(40, '0') }, [['test', 'IN_PROGRESS']]));
@@ -771,7 +768,7 @@ async function mergedWithRealCleanup(clone: string, over: { auto?: boolean; pack
   const { notices } = await watcher.poll(undefined, undefined, { cleanup: notice => cleanupLines(gitRunner, notice, { packages: over.packages }) });
   return { notices, watcher };
 }
-/** The main checkout is on `feat/x` with a commit that is not on origin/main, and origin/main moved on (the merge). */
+
 function checkoutOnAnotherBranch() {
   const w = gitWorld();
   run(w.main, 'checkout', '-q', '-b', 'feat/x');

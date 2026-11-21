@@ -7,7 +7,7 @@ import {
 import { announce, routeEvent } from '../src/route.ts';
 import { pr, type Check } from './fixtures.ts';
 
-// Seeded generator: a failing case reproduces from its seed, which every assertion message carries.
+
 const rng = (seed: number) => () => { seed = (seed + 0x6D2B79F5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
 const CASES = 200;
 type Next = () => number;
@@ -20,7 +20,7 @@ const shuffle = <T>(next: Next, items: readonly T[]): T[] => {
 
 type Context = Parameters<typeof summarizeChecks>[0][number];
 type Verdict = 'pass' | 'fail' | 'pending' | 'skip';
-/** A check as the test intends it, before it is spelled the way GitHub reports it. */
+
 interface Item { name: string; verdict: Verdict; conclusion: string; run?: number; status: boolean }
 
 const NAMES = ['test', 'lint', 'build', 'ci/status'] as const;
@@ -30,7 +30,7 @@ const CONCLUSIONS: Record<Verdict, string[]> = {
 };
 
 function item(next: Next, name: string, verdict: Verdict, run?: number): Item {
-  // `ci/status` is a commit status (StatusContext) unless the check is skipped, which only CheckRuns can be.
+
   return { name, verdict, conclusion: pick(next, CONCLUSIONS[verdict]), status: name === 'ci/status' && verdict !== 'skip', ...run === undefined ? {} : { run } };
 }
 
@@ -43,7 +43,7 @@ function randomItems(next: Next, count: number): Item[] {
 
 const url = (run: number | undefined) => (run === undefined ? undefined : `https://github.com/o/r/actions/runs/${run}/job/1`);
 
-/** The GitHub context of an item: a CheckRun, or a commit status for the `ci/status` name. */
+
 function spell(i: Item): Context {
   const link = url(i.run);
   if (i.status) {
@@ -57,7 +57,7 @@ function spell(i: Item): Context {
   };
 }
 
-/** Independent oracle: one verdict per check name, a pending one wins, then a pass, then all-skipped, else a failure. */
+
 function reference(items: Item[]) {
   const groups = new Map<string, Verdict[]>();
   for (const i of items) groups.set(i.name, [...groups.get(i.name) ?? [], i.verdict]);
@@ -101,7 +101,7 @@ test('required checks with no context on the head are named, with the runs to re
       : randomItems(next, Math.floor(next() * 6));
     const protectedNames = Array.from({ length: Math.floor(next() * 4) }, () => pick(next, [...NAMES, 'deploy']));
     const ruleNames = Array.from({ length: Math.floor(next() * 3) }, () => pick(next, [...NAMES, 'deploy']));
-    // Branch protection is unreadable without admin rights (null): then only the rulesets name required checks.
+
     const hasProtection = next() >= 0.3;
     const raw: RawPullRequest = {
       ...pr(7), commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: items.map(spell) } } } }] },
@@ -195,7 +195,7 @@ test('routing: a confirmation already given on this head is not a second wake; a
     const next = rng(seed);
     let prev: Snapshot | undefined;
     let announced: Announced | undefined;
-    // The oracle's own memory of what each slot last told the agent; it moves only on wakes.
+
     const told: { checks?: string; mergeState?: string } = {};
     const steps = 3 + Math.floor(next() * 30);
     for (let step = 0; step < steps; step++) {

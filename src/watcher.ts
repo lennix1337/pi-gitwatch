@@ -64,11 +64,11 @@ const NETWORK_ERROR = /connectex|ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI
 const noticeAfter = (error?: string) => error && NETWORK_ERROR.test(error) ? NETWORK_FAILURES_BEFORE_NOTICE : FAILURES_BEFORE_NOTICE;
 /** A candidate waits for a delivery at most this long, then goes out as a quiet notice (no model turn). */
 export const HELD_MAX_AGE_MS = 30 * 60_000;
-/** Held candidates kept per target; older ones past this cap are counted, not kept. */
+
 const MAX_HELD = 40;
-/** Held items named inline in one notice before the rest spill to a pointer. */
+
 const MAX_PENDING_INLINE = 8;
-/** Own merges remembered per repository. */
+
 const MAX_OWN_MERGES = 20;
 
 export const stateDir = () => process.env.PI_GITWATCH_DIR ?? join(homedir(), '.pi', 'agent', 'gitwatch');
@@ -80,7 +80,7 @@ export class Store {
     try {
       const state = JSON.parse(readFileSync(this.file, 'utf8')) as State;
       if (state.version === 1 && state.repos) { repair(state); return state; }
-    } catch { /* absent or unreadable: start empty */ }
+    } catch {  }
     return { version: 1, intervalSec: DEFAULT_INTERVAL_SEC, repos: {} };
   }
   save(state: State) {
@@ -93,21 +93,18 @@ export class Store {
 
 const isPlainObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 
-/**
- * The file is read back as written by any version or by hand: a watch with an unknown mode is dropped, and missing or
- * mistyped fields get their empty value (a NaN failure count would never reach the notice threshold).
- */
+
 function repair(state: State) {
   for (const [repo, watch] of Object.entries(state.repos)) {
     if (!watch || typeof watch !== 'object' || (watch.mode !== 'open' && watch.mode !== 'list')) { delete state.repos[repo]; continue; }
     if (!Array.isArray(watch.prs)) watch.prs = [];
     if (!watch.snapshots || typeof watch.snapshots !== 'object') watch.snapshots = {};
     if (!Number.isInteger(watch.failures)) watch.failures = 0;
-    // Mistyped optional marks are dropped: they only change routing, never whether a failure reaches the agent.
+    // external: Invalid optional routing marks must not suppress failure notices.
     if (!isPlainObject(watch.subscribers)) delete watch.subscribers;
     if (!Array.isArray(watch.ownMerges)) delete watch.ownMerges;
     if (!isPlainObject(watch.held) || Object.values(watch.held).some(h => !isPlainObject(h) || !Array.isArray(h.items))) delete watch.held;
-    // State written before failing-job links existed has none: no link is known for it until the next poll reads them.
+    // external: Older saved state predates failing-job links.
     for (const s of [...Object.values(watch.snapshots), ...Object.values(watch.branches ?? {})]) {
       if (s.checks && !Array.isArray(s.checks.failedJobs)) s.checks.failedJobs = [];
     }
@@ -116,7 +113,7 @@ function repair(state: State) {
 
 const itemText = (e: WatchEvent) => (e.branch ? `${e.branch} ${e.text}` : e.pr ? `#${e.pr} ${e.text}` : `gitwatch ${e.text}`);
 
-/** Held items named inline, the rest pointed at the status command; the cap's drops are counted. */
+
 function pendingText(repo: string, items: WatchEvent[], omitted: number): string {
   const inline = items.slice(0, MAX_PENDING_INLINE).map(itemText);
   const more = items.length - MAX_PENDING_INLINE;
@@ -149,17 +146,17 @@ export function noticeText(repo: string, events: WatchEvent[], snapshots: Map<nu
     `Automated watcher notice, not the operator's words: it neither grants nor withdraws permission. If the agent's standing rules or an earlier operator order cover the next step ("merge all", "work until merged"), take it now instead of reporting. More: gitwatch {"action":"status","repo":"${repo}"}`].join('\n');
 }
 
-/** Where an event's notice goes: the subscriber of its PR or branch when there is one, else this session (`main`). */
+
 function targetOf(watch: RepoWatch, e: WatchEvent): string {
   if (e.kind === 'merged' || e.kind === 'closed' || e.kind === 'cleanup') return 'main';
   const label = e.branch !== undefined ? watch.subscribers?.[`branch:${e.branch}`] : e.pr > 0 ? watch.subscribers?.[`pr:${e.pr}`] : undefined;
   return label ? `sub:${label}` : 'main';
 }
 
-/** One event per PR (or branch) and kind in a batch: a newer one replaces the older. Cleanup lines are separate facts: each is kept. */
+
 const itemKey = (e: WatchEvent) => `${e.branch !== undefined ? `branch ${e.branch}` : `pr ${e.pr}`}|${e.kind}${e.kind === 'cleanup' ? `|${e.text}` : ''}`;
 
-/** Adds candidates to a target's batch, keeping at most MAX_HELD items; the batch keeps the time its first item arrived. */
+
 function mergeHeld(held: Held | undefined, incoming: WatchEvent[], now: number): Held {
   const items = [...held?.items ?? []];
   for (const e of incoming) {
@@ -172,11 +169,7 @@ function mergeHeld(held: Held | undefined, incoming: WatchEvent[], now: number):
   return { since: held?.since ?? now, items, ...omitted ? { omitted } : {} };
 }
 
-/**
- * Turns this poll's routed events into notices per target. A respond event wakes its target, carrying that target's
- * held candidates; a merge or a batch older than HELD_MAX_AGE_MS goes out quietly; the rest waits in the returned batches.
- * The caller keeps the batches only when it delivers: a status refresh decides the same notices but holds nothing.
- */
+
 function planNotices(repo: string, watch: RepoWatch, routed: Routed[], cleanups: WatchEvent[], shown: Map<number, Snapshot>,
   shownBranches: Map<string, BranchSnapshot>, now: number, clone?: string): { notices: Notice[]; held: Record<string, Held> } {
   const targets = new Map<string, { respond: WatchEvent[]; candidates: WatchEvent[] }>();
@@ -192,18 +185,18 @@ function planNotices(repo: string, watch: RepoWatch, routed: Routed[], cleanups:
     else group.candidates.push(event);
   }
   for (const event of cleanups) bucket(targetOf(watch, event)).candidates.push(event);
-  // A target holding candidates with nothing new still ages out here.
+
   for (const key of Object.keys(watch.held ?? {})) bucket(key);
   const held: Record<string, Held> = { ...watch.held };
   const notices: Notice[] = [];
   for (const [key, { respond, candidates }] of targets) {
     const next = candidates.length || held[key] ? mergeHeld(held[key], candidates, now) : undefined;
-    // A merge, or the local cleanup it caused, is reported at once even when quiet: it is what the held changes wait for.
+
     const flush = respond.length > 0 || candidates.some(e => e.kind === 'merged' || e.kind === 'cleanup') || (next !== undefined && now - next.since >= HELD_MAX_AGE_MS);
     if (!flush) { if (next) held[key] = next; continue; }
     delete held[key];
     const primary = respond.filter(isShown);
-    // A held candidate of the same PR (or branch) and kind is superseded by the respond event that now states it.
+
     const superseded = new Set(primary.map(itemKey));
     const pending = (next?.items ?? []).filter(i => !superseded.has(itemKey(i)));
     const subscriber = key === 'main' ? undefined : key.slice('sub:'.length);
@@ -331,7 +324,7 @@ export class Watcher {
       const notices: Notice[] = [];
       const all = new Map<string, WatchEvent[]>();
       const watched = Object.entries(state.repos).filter(([repo]) => !only || repo === only);
-      // Each repository is an independent read, so they are fetched together; results are still applied in order below.
+
       const failed: { repo: string; failures: number; error: string }[] = [];
       const fetched = await settleBounded(watched, FETCH_CONCURRENCY, ([repo, watch]) => this.fetch(repo, watch, signal));
       for (const [index, [repo, watch]] of watched.entries()) {
@@ -344,7 +337,7 @@ export class Watcher {
           const shownBranches = new Map(Object.entries(watch.branches ?? {}));
           const { clone } = watch;
           const { events: cleanups, settled } = await cleanupEvents(watch, routed, options.cleanup);
-          // An auto-merge whose cleanup left nothing to do needs no turn: it is delivered with the next one.
+
           for (const r of routed) r.decision = handledMerge(r.decision, r.event, settled.has(r.event.pr));
           countRoutes(state, this.now(), routed);
           forgetOwnMerges(watch, routed);
@@ -386,10 +379,10 @@ export class Watcher {
   private async fetch(repo: string, watch: RepoWatch, signal?: AbortSignal, extraBranch?: string) {
     const tracked = [...new Set([...watch.prs, ...Object.keys(watch.snapshots).map(Number)])].slice(0, MAX_PRS);
     const names = [...new Set([...Object.keys(watch.branches ?? {}), ...extraBranch ? [extraBranch] : []])];
-    // A list watch that only holds candidates for later has nothing to read: no GraphQL request without a PR or branch.
+
     if (watch.mode === 'list' && !tracked.length && !names.length) return { snapshots: new Map<number, Snapshot>(), open: undefined, branches: new Map<string, BranchSnapshot>() };
     const fetched = await fetchRepo(this.run, repo, tracked, watch.mode === 'open', signal, names);
-    // A PR removed from an open watch is re-read on every poll and never stored: its failure would look new each time.
+    // external: Re-reading removed PRs can turn an old failure into a new false notification.
     const prs = [...fetched.prs].map(([n, raw]) => ({ n, read: reading(watch.snapshots[n], headRollup(raw), !watch.ignore?.includes(n), steps => normalize(raw, steps)) }));
     const heads = [...fetched.branches].flatMap(([name, raw]) => raw ? [{ name, read: reading(watch.branches?.[name], raw.statusCheckRollup, true, steps => normalizeBranch(name, raw, steps)) }] : []);
     const steps = await this.stepsOf([...prs, ...heads].flatMap(r => r.read.ask ?? []), signal);
@@ -418,10 +411,10 @@ export class Watcher {
    */
   private prune(watch: RepoWatch, branches = false) {
     for (const [n, s] of Object.entries(watch.snapshots)) if (s.state !== 'OPEN') delete watch.snapshots[n];
-    // Named PRs that are no longer open leave the list in both modes; an open watch kept them and re-read them forever.
+
     watch.prs = watch.prs.filter(n => watch.snapshots[n]);
-    // A held change of a PR that is gone is stale: a status refresh showed the merge and dropped the PR, and 30 minutes
-    // later its "checks passed, mergeable" went out on its own after the merge (03/11, pi-optchat #98).
+    // external: A held check result must not be announced after the same PR has merged.
+
     for (const [key, h] of Object.entries(watch.held ?? {})) {
       const items = h.items.filter(i => i.branch !== undefined || i.pr <= 0 || watch.snapshots[i.pr]);
       if (items.length) watch.held![key] = { ...h, items };
@@ -436,18 +429,14 @@ export class Watcher {
   }
 }
 
-/** A commit and its checks: what a PR snapshot and a branch snapshot have in common. */
+
 interface Head { head: string; checks: Checks }
 
-/** Whether the failure stored for a head is the one just read: the same commit with the same failing checks. */
+
 const sameFailure = (stored: Head | undefined, read: Head): stored is Head =>
   stored !== undefined && stored.head === read.head && stored.checks.state === 'fail' && read.checks.state === 'fail' && stored.checks.failing.join() === read.checks.failing.join();
 
-/**
- * A head as it was just read (`plain`: without step counts), next to what is stored for it. `ask` holds the node ids of
- * its failed jobs when its failure is not the stored one and is made of GitHub Actions jobs: only then, so once per
- * failure, is GitHub asked whether those jobs ran a step.
- */
+
 interface Reading<S extends Head> { stored: S | undefined; plain: S; ask: string[] | undefined; build: (steps: Steps) => S }
 
 function reading<S extends Head>(stored: S | undefined, rollup: RawCommit['statusCheckRollup'] | undefined, followed: boolean, build: (steps?: Steps) => S): Reading<S> {
@@ -456,11 +445,7 @@ function reading<S extends Head>(stored: S | undefined, rollup: RawCommit['statu
   return { stored, plain, build, ask: fresh ? failedJobIds(rollup, plain.checks.failing) : undefined };
 }
 
-/**
- * The snapshot of a head once the step counts were asked for. A new failure is read again with them; when they could not
- * be read (`steps` is the reason) it stays an ordinary failure that carries that reason. A failure already stored keeps
- * what was learned about it.
- */
+
 function snapshotOf<S extends Head>({ stored, plain, ask, build }: Reading<S>, steps: Steps | string): S {
   if (ask) return typeof steps === 'string' ? { ...plain, checks: { ...plain.checks, stepsError: steps } } : build(steps);
   if (!sameFailure(stored, plain)) return plain;
@@ -468,13 +453,10 @@ function snapshotOf<S extends Head>({ stored, plain, ask, build }: Reading<S>, s
   return { ...plain, checks: { ...plain.checks, ...neverStarted ? { neverStarted } : {}, ...stepsError ? { stepsError } : {} } };
 }
 
-/**
- * Concurrent GitHub reads per poll. A few repositories are typical, so this only caps a burst for a long watch list
- * and keeps the `gh` process count and GraphQL rate use bounded.
- */
+
 const FETCH_CONCURRENCY = 4;
 
-/** Runs `work` for every item with at most `limit` in flight; each outcome is settled and returned in input order. */
+
 async function settleBounded<T, R>(items: readonly T[], limit: number, work: (item: T) => Promise<R>): Promise<PromiseSettledResult<R>[]> {
   const results: PromiseSettledResult<R>[] = [];
   let next = 0;
@@ -489,14 +471,14 @@ async function settleBounded<T, R>(items: readonly T[], limit: number, work: (it
   return results;
 }
 
-/** The value of a settled read, or its failure rethrown where the caller handles it. */
+
 function settledValue<R>(outcome: PromiseSettledResult<R>): R {
   if (outcome.status === 'rejected') throw outcome.reason;
   return outcome.value;
 }
 
 
-/** A subscriber stays only while its PR or branch is followed. */
+
 function pruneSubscribers(watch: RepoWatch) {
   if (!watch.subscribers) return;
   for (const key of Object.keys(watch.subscribers)) {
@@ -513,17 +495,11 @@ function setSubscribers(watch: RepoWatch, prs: number[], branch: string | undefi
   if (branch) subscribers[`branch:${branch}`] = label;
 }
 
-/**
- * Whether a re-read PR replaces its stored snapshot. A PR that merged or closed since the last poll keeps its stored open
- * snapshot, so the next poll announces the transition.
- */
+
 const takesSnapshot = (watch: RepoWatch, n: number, s: Snapshot): boolean =>
   ((s.state === 'OPEN' && !watch.ignore?.includes(n)) || watch.prs.includes(n)) && (s.state === 'OPEN' || watch.snapshots[n] === undefined);
 
-/**
- * A snapshot taken over an earlier one keeps what the agent was already told about the PR, and the auto-merge stall clock of
- * the same head: a new head starts its own clock.
- */
+
 const keepTracked = (next: Snapshot, prev: Snapshot | undefined): Snapshot => {
   if (!prev) return next;
   const sameHead = prev.head === next.head && prev.passedAt !== undefined;
@@ -534,7 +510,7 @@ const keepTracked = (next: Snapshot, prev: Snapshot | undefined): Snapshot => {
   };
 };
 
-/** The watch a request leads to, before GitHub confirms its PRs and branch exist. */
+
 function nextWatch(existing: RepoWatch | undefined, { prs, branch }: WatchRequest): RepoWatch {
   const mode = prs?.length || branch ? 'list' : 'open';
   const merged = mode === 'list' && existing?.mode === 'list' ? [...new Set([...existing.prs, ...prs ?? []])] : prs ?? [];
@@ -547,28 +523,28 @@ function nextWatch(existing: RepoWatch | undefined, { prs, branch }: WatchReques
     ...existing?.held ? { held: existing.held } : {},
   };
   const ignore = existing?.ignore?.filter(n => !prs?.includes(n));
-  // Watching the whole repository again forgets the PRs unwatched from it; adding PRs or a branch keeps that list.
+
   if (watch.mode === 'open' && ignore?.length && (prs?.length || branch)) watch.ignore = ignore;
   if (!branch) return watch;
   if (!watch.branches?.[branch] && Object.keys(watch.branches ?? {}).length >= MAX_BRANCHES) throw new Error(`At most ${MAX_BRANCHES} branches per repository.`);
-  // Re-watching a branch starts over: the latest commit's CI is reported even if an older one already was.
+
   watch.branches = { ...watch.branches };
   delete watch.branches[branch];
   return watch;
 }
 
-/** A transition the watcher routed, with the reason. */
+
 interface Routed { event: WatchEvent; decision: Decision }
 
-/** Moves every tracked PR to its new snapshot and routes the transitions, auto-merge stalls included. */
+
 function advancePrs(watch: RepoWatch, snapshots: Map<number, Snapshot>, open: number[] | undefined, now: number): Routed[] {
   const out: Routed[] = [];
   for (const n of new Set([...Object.keys(watch.snapshots).map(Number), ...watch.prs, ...open ?? []])) {
     const cur = snapshots.get(n);
     if (watch.ignore?.includes(n) || !cur) continue;
     const prev = watch.snapshots[n];
-    // A PR that reads CLOSED may be a merge GitHub has not recorded yet (Genexus18MCP #1044, auto-merge): keep the open
-    // snapshot for one poll and report what the next poll reads, merged or still closed.
+    // external: GitHub may briefly show a merged PR as closed before its merge is recorded.
+
     if (prev?.state === 'OPEN' && cur.state === 'CLOSED' && !prev.closing) { watch.snapshots[n] = { ...prev, closing: true }; continue; }
     const { snapshot, event: stall } = autoMergeStall(prev, settle(prev, cur), now);
     let next = snapshot;
@@ -587,7 +563,7 @@ function advancePrs(watch: RepoWatch, snapshots: Map<number, Snapshot>, open: nu
   return out;
 }
 
-/** Moves every watched branch to its latest commit; a deleted branch has nothing left to report and is dropped. */
+
 function advanceBranches(watch: RepoWatch, branches: Map<string, BranchSnapshot>): Routed[] {
   const out: Routed[] = [];
   for (const [name, prev] of Object.entries(watch.branches ?? {})) {
@@ -600,17 +576,14 @@ function advanceBranches(watch: RepoWatch, branches: Map<string, BranchSnapshot>
   return out;
 }
 
-/**
- * Local cleanup for the merged PRs of this poll, whatever their route: a merge this session made still cleans its
- * branches. `settled` holds the PRs whose cleanup ran and left nothing for the agent; no known clone settles none.
- */
+
 async function cleanupEvents(watch: RepoWatch, routed: Routed[], cleanup?: PollOptions['cleanup']): Promise<{ events: WatchEvent[]; settled: Set<number> }> {
   const clone = watch.clone;
   const merged = routed.map(r => r.event).filter(e => e.kind === 'merged' && e.head !== undefined);
   if (!cleanup || !clone || !merged.length) return { events: [], settled: new Set() };
   const lines = await cleanup({ clone, events: merged });
   const left = new Set(lines.filter(l => l.left).map(l => l.pr));
-  // Fast-forward and reload lines already name their folder; the others are about the clone the push came from.
+
   const events = lines.map(l => ({ pr: l.pr, kind: 'cleanup' as const, text: /^(reload needed|fast-forwarded|skipped fast-forward|switched)/.test(l.text) ? l.text : `${l.text} (in ${clone})`, wake: false }));
   return { events, settled: new Set(merged.map(e => e.pr).filter(pr => !left.has(pr))) };
 }
@@ -620,7 +593,7 @@ function countRoutes(state: State, now: number, routed: Routed[]) {
   for (const { decision } of routed) routes[decision.route]++;
 }
 
-/** A merge or close ends the own-merge mark of its PR once the watcher has seen it. */
+
 function forgetOwnMerges(watch: RepoWatch, routed: Routed[]) {
   if (!watch.ownMerges) return;
   const ended = new Set(routed.filter(r => r.event.kind === 'merged' || r.event.kind === 'closed').map(r => r.event.pr));
@@ -644,14 +617,14 @@ export async function watchPush(watcher: Watcher, repo: string, branch: string, 
   return `${repo} #${pr}`;
 }
 
-/** Whether a watch needs the pull requests read on every fetch: an open watch, a listed PR, or a snapshot still shown. */
+
 function tracksPulls(watch: RepoWatch): boolean {
   return watch.mode === 'open' || watch.prs.length > 0 || Object.keys(watch.snapshots).length > 0;
 }
 
-/** A list watch with no PR and no branch left has nothing to follow. */
+
 const isEmpty = (watch: RepoWatch) => watch.mode === 'list' && !watch.prs.length && !Object.keys(watch.branches ?? {}).length;
-/** Watcher-level events (pr 0 without a branch) are not about any PR line. */
+
 const isShown = (e: WatchEvent) => e.pr !== 0 || e.branch !== undefined;
 
 /** The status the tool returns: aggregates first, then one line per PR with its next step. */
@@ -665,7 +638,7 @@ export function statusText(state: State, events: Map<string, WatchEvent[]>, only
     + `\nEvery ${state.intervalSec}s the watcher requests a turn on failed or finished checks, conflicts, merges (auto-merge included) and closes, and when a watched branch's CI finishes.${stats}`;
 }
 
-/** Lifetime counters across all repositories; no historical routing count is upgraded to delivery evidence. */
+
 const sinceText = (at: number) => new Date(at).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
 function deliveryText(state: State): string {
   const planned = state.stats;
@@ -681,7 +654,7 @@ function deliveryText(state: State): string {
   return routing + byEvent + `\nDelivery evidence (all repos) since ${sinceText(d.since)}. Host accepted: ${d.wakeAccepted} wake requests, ${d.quietAccepted} next-turn notices; ${d.uncertain} uncertain (no automatic replay). These are not model runs or saved turns.` + subscribers;
 }
 
-/** One repository's status: totals, poll health, changes this refresh found, what waits for a turn, then a line per PR and branch. */
+
 function repoStatus(repo: string, w: RepoWatch, events: WatchEvent[]): string {
   const prs = Object.values(w.snapshots).sort((a, b) => a.number - b.number);
   const count = (f: (s: Snapshot) => boolean) => prs.filter(f).length;

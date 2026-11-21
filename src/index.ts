@@ -22,18 +22,18 @@ export class Lease {
     try {
       const held = JSON.parse(readFileSync(this.file, 'utf8')) as { pid: number; at: number };
       if (held.pid !== this.pid && now - held.at < staleMs && alive(held.pid)) return false;
-    } catch { /* no lease yet */ }
+    } catch {  }
     mkdirSync(this.dir, { recursive: true });
     writeFileSync(this.file, JSON.stringify({ pid: this.pid, at: now }));
     return true;
   }
   release() {
-    try { if ((JSON.parse(readFileSync(this.file, 'utf8')) as { pid: number }).pid === this.pid) rmSync(this.file); } catch { /* already gone */ }
+    try { if ((JSON.parse(readFileSync(this.file, 'utf8')) as { pid: number }).pid === this.pid) rmSync(this.file); } catch {  }
   }
 }
 const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code === 'EPERM'; } };
 
-/** The poll loop: `waiting` for the next tick, `polling` inside one, `stopped` when the session is not following. */
+
 type Loop = { phase: 'stopped' } | { phase: 'waiting'; timer: unknown } | { phase: 'polling' };
 const LOOP_MOVES: Record<Loop['phase'], Loop['phase'][]> = { stopped: ['waiting', 'stopped'], waiting: ['polling', 'stopped'], polling: ['waiting', 'stopped'] };
 
@@ -44,7 +44,7 @@ export interface Options {
   packages?: () => string[];
 }
 
-/** Commands worth inspecting after they ran: a push or a PR creation. */
+
 const PUSH_OR_PR = /\bgit\b[^\n]*\bpush\b|\bgh\s+pr\s+create\b/;
 
 /**
@@ -131,7 +131,7 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
     publish(NOTICE_CHANNEL, live);
   };
 
-  // A notice that needs the agent wakes it; an expected merge is appended to the session at once, visible to the operator and in the model's context, and starts no turn.
+
   const deliver = async (notice: Notice) => {
     if (notice.subscriber) {
       const claimed = claimForSubscriber(notice.subscriber, notice);
@@ -141,14 +141,15 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
     const text = notice.subscriber ? `${notice.text}\n(For ${notice.subscriber}: no subscriber accepted it, so it is delivered here.)` : notice.text;
     let accepted = false;
     try {
-      // Never `deliverAs: 'nextTurn'` for a quiet notice: Pi keeps those in memory until the operator writes again (surviving a reload, with the display flag of the code that queued them) and only then renders them.
-      // `triggerTurn: false` appends the message now (after the current turn if one is running), with no model call.
+      // external: never `deliverAs: 'nextTurn'` for a quiet notice; Pi holds those until the operator writes again.
       await pi.sendMessage(
         { customType: MESSAGE_TYPE, content: text, display: true, details: { repo: notice.repo, events: notice.events } },
         notice.wake ? { triggerTurn: true, deliverAs: 'steer' } : { triggerTurn: false },
       );
       accepted = true;
-    } catch { /* A rejected dispatch may have taken effect; record uncertainty without replaying it. */ }
+    } catch {
+      // external: A rejected dispatch may already have taken effect and must not be replayed.
+    }
     if (accepted) publishNotice(notice);
     await watcher.recordDelivery(notice.wake, accepted);
     if (!accepted) warn?.('Gitwatch: notice delivery is uncertain. Inspect session activity before retrying; no automatic replay.');
@@ -163,14 +164,14 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
       if ((Object.keys(state.repos).length || follows.length) && lease.acquire(now(), interval * 3)) {
         for (const { request, done } of follows) {
           try {
-            // A script that names no clone (older ship.mjs) still pushed from a checkout of the repository: a loaded Pi package is the one we can find.
+
             const clone = request.clone ?? (watcher.state().repos[request.repo]?.clone ? undefined : await packageClone(request.repo, packages(), git));
             await watcher.watch(request.repo, { prs: [request.pr], ...clone ? { clone } : {}, ...request.subscriber ? { subscriber: request.subscriber } : {} });
             done();
           }
           catch (error) {
             const message = error instanceof Error ? error.message : String(error);
-            // A PR that is gone or already ended has nothing to follow; anything else (network) is retried next poll.
+            // external: Network failures are distinct from a PR that no longer exists.
             if (/^Not found|already merged or closed/.test(message)) done();
             warn?.(`Gitwatch: could not follow ${request.repo} #${request.pr} asked by another process (${message.split('\n')[0]}).`);
           }
@@ -186,7 +187,7 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
   const start = () => { if (interactive && loop.phase === 'stopped') wait(1000, epoch); };
   const stop = () => {
     epoch++;
-    // Pi throws from a ctx whose session was reloaded or replaced; a poll still in flight must not reach it.
+    // external: Pi rejects UI calls to a context invalidated by session reload.
     warn = undefined;
     if (loop.phase === 'waiting') cancel(loop.timer);
     move({ phase: 'stopped' });
@@ -202,7 +203,7 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
     start();
   });
   pi.on('session_shutdown', stop);
-  // Only the polling (interactive) session follows its own pushes and merges; a child's push or merge is its parent's to watch.
+
   pi.on('tool_result', async (event, ctx) => {
     if (loop.phase !== 'stopped') {
       try { await noteOwnMerges(event as BashResult, watcher, git, ctx.cwd); }
@@ -241,7 +242,7 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
         }
         const before = watcher.state();
         if (params.repo && !before.repos[params.repo]) return reply(statusText(before, new Map(), params.repo, now()));
-        // Changes found by this refresh are shown here, so they are not announced again.
+
         const { events } = Object.keys(before.repos).length ? await watcher.poll(params.repo, signal, { deliver: false, cleanup }) : { events: new Map() };
         if (Object.keys(before.repos).length) publishState();
         return reply(statusText(watcher.state(), events, params.repo, now()));
@@ -257,7 +258,7 @@ const reply = (text: string) => ({ content: [{ type: 'text' as const, text }], d
 
 interface Params { action?: string; repo?: string; prs?: number[]; branch?: string; intervalSec?: number; subscriber?: string }
 
-/** Rejects a call before any GitHub request, with the corrective hint. */
+
 function validate(action: string, params: Params) {
   if (!(actions as readonly string[]).includes(action)) throw new Error(`Unknown action ${action}; use status, watch or unwatch.`);
   if (params.repo !== undefined && !REPO.test(params.repo)) throw new Error('repo must be owner/name, e.g. lennix1337/Genexus18MCP.');
@@ -286,7 +287,7 @@ export async function noteOwnMerges(event: BashResult, watcher: Watcher, git: Gi
   if (!/\bgh\s+pr\s+merge\b/.test(command)) return;
   const output = event.content.flatMap(c => c.type === 'text' ? [c.text] : []).join('\n');
   for (const merge of ownMerges(command, cwd, output)) {
-    // A clone without an origin remote names no GitHub repository: there is nothing to record.
+
     const repo = merge.repo ?? githubRepo(await git(['remote', 'get-url', 'origin'], merge.dir).catch(() => ''));
     if (repo) await watcher.noteOwnMerge(repo, merge.pr);
   }

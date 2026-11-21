@@ -76,7 +76,7 @@ export class FakeGitHub {
       if (this.failSteps) throw new Error(this.failSteps);
       return JSON.stringify({ data: { nodes: (JSON.parse(`[${ids}]`) as string[]).map(id => (this.steps.has(id) ? { id, steps: { totalCount: this.steps.get(id) } } : null)) } });
     }
-    // Like GitHub: a fragment defined but never spread fails the whole request.
+    // external: GitHub GraphQL rejects unused fragment definitions.
     if (query.includes('fragment F ') && !query.includes('...F')) throw new Error('gh: Fragment F was defined, but not used');
     const repository: Record<string, unknown> = {};
     for (const [, n] of query.matchAll(/p(\d+): pullRequest/g)) repository[`p${n}`] = this.prs.get(Number(n)) ?? null;

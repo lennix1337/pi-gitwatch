@@ -265,7 +265,7 @@ test('a failure is called never started only when every failed job is an Actions
     assert.equal('neverStarted' in failed.checks, false, what);
     assert.match(line(failed), /checks fail 0✓ 2✗ 0…/, what);
   }
-  // A commit status and another app's check have no steps by nature: one of them failing means something did run.
+  // external: Commit statuses and external checks may fail without job steps.
   const others = [
     { __typename: 'StatusContext', context: 'ci/external', state: 'FAILURE', targetUrl: 'https://ci.example/1' },
     { __typename: 'CheckRun', id: 'CR_coverage', name: 'coverage', status: 'COMPLETED', conclusion: 'FAILURE', detailsUrl: 'https://coverage.example/report/1' },

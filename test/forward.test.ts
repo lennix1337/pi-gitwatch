@@ -7,7 +7,7 @@ import { cleanupLines, fastForwardMain } from '../src/cleanup.ts';
 import { normalizePath } from '../src/packages.ts';
 import { gitWorld as world, run } from './fixtures.ts';
 
-/** The folder spelled differently from what git prints: upper case where the filesystem ignores case (Windows), a trailing slash everywhere. */
+
 const spelled = (p: string) => `${process.platform === 'win32' ? p.toUpperCase() : p}/`;
 const norm = (p: string) => p.replaceAll('\\', '/').toLowerCase();
 
@@ -42,7 +42,7 @@ test('a push from a linked worktree updates the main checkout, not the worktree'
   assert.ok(lines.some(l => l.text.startsWith('removed worktree') && l.text.endsWith('and branch feat/x')), lines.map(l => l.text).join('\n'));
   const forwarded = lines.find(l => l.text.startsWith('fast-forwarded main in'));
   assert.ok(forwarded, lines.map(l => l.text).join('\n'));
-  // Git prints the folder in its own spelling (long name, resolved link): compare the folder, not the string.
+
   assert.equal(normalizePath(/^fast-forwarded main in (.*) to [0-9a-f]+ /.exec(forwarded.text)![1]), normalizePath(w.main));
   assert.equal(run(w.main, 'rev-parse', 'HEAD'), run(w.other, 'rev-parse', 'HEAD'));
   assert.ok(lines.every(l => !l.left), 'nothing is left once the branch, worktree and main checkout are handled');
@@ -120,7 +120,7 @@ test('a loaded Pi package adds a `reload needed` line that is left for the agent
 test('a package named by another spelling of the checkout git reports (8.3 short name, junction) is still that checkout', async () => {
   const w = world();
   w.merge();
-  // The same folder through a second path, as the settings file or a short temp dir would spell it; git reports the real one.
+
   const alias = join(w.root, 'ALIAS');
   symlinkSync(w.root, alias, 'junction');
   const lines = await cleanupLines(gitRunner, { clone: join(alias, 'main'), events: [merged()] }, { packages: [join(alias, 'main')] });
@@ -128,7 +128,7 @@ test('a package named by another spelling of the checkout git reports (8.3 short
   assert.ok(lines.some(l => l.text.startsWith('reload needed')), lines.map(l => l.text).join(', '));
 });
 
-/** The main checkout on `feat/x` holding one commit (a new file) that the "other" clone lands on origin/main as a squash merge: same patch, new commit. */
+
 function featureOnMain(world_ = world()) {
   const w = world_;
   run(w.main, 'checkout', '-q', '-b', 'feat/x');

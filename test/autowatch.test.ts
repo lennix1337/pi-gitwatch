@@ -18,8 +18,8 @@ test('git push is found with its directory, remote and branch', () => {
   assert.deepEqual(pushes('git push -o ci.skip origin +fix', '/w'), [{ dir: '/w', remote: 'origin', branch: 'fix' }]);
 });
 
-// Seen live 2026-10-30: every `cd /c/projetos/<repo> && git push` from Git Bash ended in "could not start following push
-// in /c/projetos/<repo>: spawn git ENOENT", because Node on Windows took /c/projetos for a folder on the current drive.
+// external: Node on Windows does not interpret Git Bash /c paths as drive paths.
+
 test('a Git Bash drive path names the Windows folder git runs in', () => {
   assert.equal(nativePath('/c/projetos/pi-optchat', 'win32'), 'C:/projetos/pi-optchat');
   assert.equal(nativePath('/d', 'win32'), 'D:/');
@@ -34,8 +34,8 @@ test('tags, deletions, dry runs and non-push git commands are ignored', () => {
     'git push origin refs/tags/v1', 'git log --oneline | grep push', 'echo git push']) assert.deepEqual(pushes(command, '/w'), [], command);
 });
 
-// Seen live 2026-11-05: `cd ~/.optchat/profiles/x && ...` made git run in "C:\Users\me\~\.optchat\..." (spawn ENOENT), and a
-// node -e script that merely contained "git push" inside a quoted regex was taken for a push.
+// external: Git Bash expands tilde before executing git.
+
 test('cd ~ and $HOME name the home folder, not a folder called ~', () => {
   const homeDir = homedir().replaceAll('\\', '/');
   assert.deepEqual(pushes('cd ~/proj && git push origin main', '/w'), [{ dir: `${homeDir}/proj`, remote: 'origin', branch: 'main' }]);
@@ -63,7 +63,7 @@ test('a push resolves to a GitHub repository and branch through git', async () =
 });
 
 test('the remote URL and the repository root of a push are read together, not one after the other', async () => {
-  // Deterministic: each git call waits until the other has started. Sequential reads would time out.
+
   let started = 0;
   const barrier = async () => {
     started++;
@@ -74,8 +74,8 @@ test('the remote URL and the repository root of a push are read together, not on
   assert.deepEqual(await resolvePush({ dir: '/w', remote: 'origin', branch: 'main' }, git), { repo: 'o/r', branch: 'main', clone: 'C:/w' });
 });
 
-// Seen live 2026-11-01/02: a bare `git push` from a worktree whose branch tracks a fork (other remote, other branch name)
-// ended in "Branch fix/x not found in lennix1337/Genexus18MCP", because the push was read as going to origin under the local name.
+
+
 test('a bare push follows the remote and branch the push really goes to', async () => {
   const git = async (args: string[]) => args[0] === 'remote' ? (args[2] === 'fork' ? 'https://github.com/davidagostini/Genexus18MCP.git' : 'https://github.com/lennix1337/Genexus18MCP.git')
     : args.includes('@{push}') ? 'fork/fix/x-remote' : args[1] === '--show-toplevel' ? 'C:/w' : 'fix/x';
@@ -101,7 +101,7 @@ test('a gh pr merge that merges now is an own merge; a queued one (--auto), a dr
   assert.deepEqual(ownMerges('cd sub && gh pr merge 5', '/x'), [{ pr: 5, dir: resolve('/x', 'sub') }], 'the merge runs where the cd leads');
 });
 
-// Seen live 2026-11-13: `git push origin v0.1.1` ended in "Branch v0.1.1 not found in lennix1337/pi-vault", a tag read as a branch.
+
 test('a push of a tag name follows nothing; a branch of the same repository still does', async () => {
   const git = async (args: string[]) => {
     if (args[0] === 'rev-parse' && args[1] === '--verify') { if (args.at(-1) === 'refs/tags/v0.1.1') return 'abc'; throw new Error('unknown ref'); }
