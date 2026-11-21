@@ -10,7 +10,7 @@ const dir = mkdtempSync(join(tmpdir(), 'gitwatch-delivery-mutants-'));
 const mutations = [
   ['unawaited-host', 'src/index.ts', 'await pi.sendMessage(', 'pi.sendMessage('],
   ['missing-receipt', 'src/index.ts', 'await watcher.recordDelivery(notice.wake, accepted);', '/* receipt omitted */'],
-  ['rejection-counted-as-success', 'src/index.ts', '} catch { /* A rejected dispatch', '} catch { accepted = true; /* A rejected dispatch'],
+  ['rejection-counted-as-success', 'src/index.ts', '      // external: A rejected dispatch', '      accepted = true; // external: A rejected dispatch'],
 ];
 const run = () => spawnSync(process.execPath, ['--import', 'tsx', '--test', 'test/extension.test.ts', 'test/watcher.test.ts'], {
   cwd: dir, encoding: 'utf8', timeout: 90000,

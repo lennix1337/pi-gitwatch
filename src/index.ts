@@ -141,8 +141,7 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
     const text = notice.subscriber ? `${notice.text}\n(For ${notice.subscriber}: no subscriber accepted it, so it is delivered here.)` : notice.text;
     let accepted = false;
     try {
-      // external: Pi nextTurn notices remain pending until the operator writes.
-
+      // external: never `deliverAs: 'nextTurn'` for a quiet notice; Pi holds those until the operator writes again.
       await pi.sendMessage(
         { customType: MESSAGE_TYPE, content: text, display: true, details: { repo: notice.repo, events: notice.events } },
         notice.wake ? { triggerTurn: true, deliverAs: 'steer' } : { triggerTurn: false },
