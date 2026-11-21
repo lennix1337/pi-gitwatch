@@ -31,7 +31,7 @@ export function createdPrs(command: string, output: string): CreatedPr[] {
   return [...found.values()];
 }
 
-/** Splits a shell token list, honouring simple single and double quotes. */
+
 function tokens(segment: string): string[] {
   return [...segment.matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)].map(m => m[1] ?? m[2] ?? m[3]);
 }
@@ -55,9 +55,9 @@ export function segments(command: string): string[] {
   return out;
 }
 
-/** Options that make a push carry no branch commit worth following. */
+
 const NOT_A_BRANCH_PUSH = new Set(['--tags', '--delete', '-d', '--mirror', '--all', '--dry-run', '-n', '--prune']);
-/** Options whose value is the next word, so it is not taken for the remote or refspec. */
+
 const WITH_VALUE = new Set(['-o', '--push-option', '--repo', '--receive-pack', '--exec']);
 
 /**
@@ -80,9 +80,9 @@ export function pushes(command: string, cwd: string): Push[] {
 
 /** A PR a shell command merged with `gh pr merge` (not queued with `--auto`), the repository it names, and where it ran. */
 export interface OwnMerge { pr: number; repo?: string; dir: string }
-/** What gh prints when a merge did not happen (unknown PR, failing checks, a blocked merge, or a refused call). */
+
 const MERGE_FAILED = /GraphQL:|Pull request #?\d+ is not mergeable|\bNot run:|^X |failed to |could not |was already merged|is closed/im;
-/** `gh pr merge` options that take a value, so the value is not read as the PR. */
+
 const MERGE_WITH_VALUE = new Set(['-b', '--body', '-F', '--body-file', '-t', '--subject', '-A', '--author-email', '--match-head-commit']);
 
 /**
@@ -91,7 +91,7 @@ const MERGE_WITH_VALUE = new Set(['-b', '--body', '-F', '--body-file', '-t', '--
  * A merge made through the web or another tool is not seen here.
  */
 export function ownMerges(command: string, cwd: string, output = ''): OwnMerge[] {
-  // `gh pr merge ... | head`, `; echo rc=$?` and `|| true` hide a failed merge from the tool's exit status; gh's own error says it.
+  // external: Shell pipelines or fallback commands can hide a failed gh merge exit status.
   if (MERGE_FAILED.test(output)) return [];
   const found: OwnMerge[] = [];
   let dir = cwd;
@@ -121,14 +121,14 @@ export function ownMerges(command: string, cwd: string, output = ''): OwnMerge[]
 /** Git Bash spells `C:\x` as `/c/x`; Node on Windows reads that as `\c\x` on the current drive, where git cannot start (spawn ENOENT). */
 export const nativePath = (path: string, platform: string = process.platform) =>
   platform === 'win32' ? path.replace(/^\/([A-Za-z])(?:\/|$)/, (_, drive: string) => `${drive.toUpperCase()}:/`) : path;
-/** `~` and `$HOME` are the user's home folder; the shell has expanded them by the time git runs, but not in the command text. */
+// external: Git Bash expands home paths before git executes.
 const home = (path: string) => path.replace(/^(?:~|\$HOME|\$\{HOME\})(?=\/|\\|$)/, () => homedir().replace(/\\/g, '/'));
 const within = (dir: string, path: string) => {
   const native = nativePath(home(path));
   return isAbsolute(native) || /^[A-Za-z]:[\\/]/.test(native) ? native : resolve(dir, native);
 };
 
-/** One `git [-C dir] [-c k=v] push [options] [remote [refspec]]` command, or undefined when it pushes no branch. */
+
 function gitPush(words: string[], dir: string): Push | undefined {
   let at = 1, here = dir;
   while (words[at]?.startsWith('-')) {
@@ -149,7 +149,7 @@ function gitPush(words: string[], dir: string): Push | undefined {
 export async function resolvePush(push: Push, git: GitRunner): Promise<{ repo: string; branch: string; clone?: string } | undefined> {
   const target = push.implicitRemote && !push.branch ? await upstreamOf(push.dir, git) : undefined;
   const remote = target?.remote ?? push.remote;
-  // The remote URL, the branch and the repository root are independent reads of the same folder: they go out together.
+
   const [url, branch, clone] = await Promise.all([
     /^(https?:|git@|ssh:)/.test(remote) ? remote : git(['remote', 'get-url', remote], push.dir),
     push.branch ?? target?.branch ?? git(['rev-parse', '--abbrev-ref', 'HEAD'], push.dir),
@@ -157,7 +157,7 @@ export async function resolvePush(push: Push, git: GitRunner): Promise<{ repo: s
   ]);
   const repo = githubRepo(url);
   if (!repo || !branch || branch === 'HEAD' || !BRANCH.test(branch)) return undefined;
-  // `git push origin v1.2.3` names a tag when no local branch has that name: there is no branch CI to follow.
+  // external: A push ref can name a tag rather than a branch.
   if (push.branch && await isTagOnly(push.dir, branch, git)) return undefined;
   return { repo, branch, ...clone ? { clone } : {} };
 }
@@ -168,7 +168,7 @@ async function isTagOnly(dir: string, name: string, git: GitRunner): Promise<boo
   return tag && !head;
 }
 
-/** Where a bare `git push` goes (`@{push}`: the upstream remote and branch name, which may be a fork under another name); undefined without an upstream. */
+
 async function upstreamOf(dir: string, git: GitRunner): Promise<{ remote: string; branch: string } | undefined> {
   const ref = await git(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{push}'], dir).catch(() => '');
   const cut = ref.indexOf('/');

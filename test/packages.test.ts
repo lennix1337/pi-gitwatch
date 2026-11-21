@@ -47,7 +47,7 @@ test('the clone for a repository is the loaded package whose origin is that repo
   assert.equal(await packageClone('o/zzz', packages, git), undefined);
 });
 
-/** A real folder and a second spelling of it (a junction on Windows, a symlink elsewhere): what 8.3 short names or a linked temp dir look like to a string comparison. */
+
 function twoSpellings() {
   const root = tempDir();
   const real = join(root, 'real-folder-with-a-long-name');

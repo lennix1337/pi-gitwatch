@@ -3,13 +3,13 @@ import { join } from 'node:path';
 import type { GitRunner } from './autowatch.ts';
 import { isLoadedPackage } from './packages.ts';
 
-/** Long-lived branches are never cleaned, even when one happens to point at a merged PR head. */
+
 const PROTECTED = new Set(['main', 'master', 'trunk', 'develop']);
 
-/** The last line of a failure: execFile puts git's stderr after a "Command failed" line, and its last line names the reason. */
+// external: execFile includes git stderr after the command-failed line.
 const lastLine = (error: unknown) => String((error as Error).message ?? error).split(/\r?\n/).filter(l => l.trim()).pop();
 
-/** A branch kept because the main worktree has it checked out, or its worktree holds uncommitted work: the agent's own state, not a failure. */
+
 const STAYS_QUIET = /^kept [^:]+: (checked out in |.*contains modified or untracked files)/;
 
 interface Worktree { path: string; branch?: string; main: boolean }
@@ -31,25 +31,25 @@ export function parseWorktrees(porcelain: string): Worktree[] {
  * kept too. Returns one line per branch found.
  */
 export async function cleanMerged(git: GitRunner, clone: string, head: string): Promise<string[]> {
-  // A contributor's PR head this clone never fetched: no local branch can point at it, so there is nothing to clean.
+  // external: A contributor PR head not fetched locally has no local branch to clean.
   try { await git(['rev-parse', '--verify', '--quiet', `${head}^{commit}`], clone); } catch { return []; }
   const refs = await git(['for-each-ref', '--points-at', head, '--format=%(refname:short)', 'refs/heads'], clone);
   const branches = refs.split(/\r?\n/).map(b => b.trim()).filter(b => b && !PROTECTED.has(b));
   if (!branches.length) return [];
   const trees = parseWorktrees(await git(['worktree', 'list', '--porcelain'], clone));
-  // Mutate from the main worktree: `clone` may be a linked worktree that is itself about to go away or is unrelated.
+  // external: A linked worktree may itself be removed during cleanup.
   const main = trees[0]?.path && existsSync(trees[0].path) ? trees[0].path : clone;
   const lines: string[] = [];
   for (const branch of branches) {
     const tree = trees.find(t => t.branch === branch);
     if (tree?.main) { lines.push(`kept ${branch}: checked out in ${tree.path}`); continue; }
     try {
-      // A worktree whose folder is already gone (git lists it as prunable) has nothing to remove: drop its record.
+      // external: Git can retain prunable worktree entries whose folders are already gone.
       if (tree) await git(existsSync(tree.path) ? ['worktree', 'remove', tree.path] : ['worktree', 'prune'], main);
       await git(['branch', '-D', branch], main);
       lines.push(`removed ${tree ? `worktree ${tree.path} and ` : ''}branch ${branch}`);
     } catch (error) {
-      // execFile puts git's stderr after a "Command failed" line; its last line names the reason.
+      // external: execFile appends git stderr after the command-failed line.
       const reason = String((error as Error).message ?? error).split(/\r?\n/).filter(l => l.trim()).pop();
       lines.push(`kept ${branch}: ${reason}`);
     }
@@ -63,7 +63,7 @@ export async function cleanMerged(git: GitRunner, clone: string, head: string): 
  */
 export interface CleanupLine { pr: number; text: string; left?: true }
 
-/** The branch the repository's default is, from `origin/HEAD`, else the usual names; `main` and `master` only as a fallback. */
+
 async function defaultBranch(git: GitRunner, dir: string): Promise<string[]> {
   const ref = await git(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], dir).catch(() => '');
   return ref.startsWith('origin/') ? [ref.slice('origin/'.length)] : ['main', 'master'];
@@ -80,7 +80,7 @@ export async function fastForwardMain(git: GitRunner, main: string): Promise<{ t
     const branch = await git(['symbolic-ref', '--short', 'HEAD'], main).catch(() => '');
     if (!branch) return skip('HEAD is detached');
     const defaults = await defaultBranch(git, main);
-    // The agent's own work on another branch is not a failure: nothing here is waiting for it.
+
     if (!defaults.includes(branch)) return { text: `skipped fast-forward of ${main}: it is on ${branch}, not ${defaults.join('/')}` };
     if (await git(['status', '--porcelain', '--untracked-files=no'], main)) return skip('it has uncommitted changes');
     const upstream = await git(['rev-parse', '--abbrev-ref', `${branch}@{upstream}`], main).catch(() => '');
@@ -140,10 +140,10 @@ export async function cleanupLines(git: GitRunner, notice: { clone?: string; eve
   if (!merged.length) return [];
   const clone = existsSync(notice.clone) ? notice.clone : survivingMain(notice.clone);
   if (!clone) return merged.map(e => ({ pr: e.pr, text: `cleanup skipped: ${notice.clone} no longer exists, so its main checkout was not updated`, left: true as const }));
-  // Found first: removing a merged linked worktree may delete the folder this clone names.
+  // external: Removing a linked worktree can delete the folder identifying this clone.
   const main = await mainCheckout(git, clone);
   const lines: CleanupLine[] = [];
-  // One checkout-level result per poll is filed under the last merged PR, as the fast-forward is.
+
   const pr = merged[merged.length - 1].pr;
   for (const text of await switchMergedBranch(git, main, merged.map(e => e.head!)) ?? []) lines.push({ pr, text });
   for (const e of merged) {
@@ -151,20 +151,20 @@ export async function cleanupLines(git: GitRunner, notice: { clone?: string; eve
       for (const text of await cleanMerged(git, clone, e.head!)) lines.push({ pr: e.pr, text, ...text.startsWith('removed ') || STAYS_QUIET.test(text) ? {} : { left: true as const } });
     } catch (error) { lines.push({ pr: e.pr, text: `cleanup skipped: ${lastLine(error)}`, left: true }); }
   }
-  // The checkout to update and to reload is the main one, whichever linked worktree the push came from.
+
   const forward = await fastForwardMain(git, main);
   if (forward) lines.push({ pr, ...forward });
   if (isLoadedPackage(main, options.packages ?? [])) lines.push({ pr, text: `reload needed: ${main} is a loaded Pi package`, left: true });
   return lines;
 }
 
-/** The repository a removed linked worktree (`<repo>/worktrees/<name>` or `<repo>/.worktrees/<name>`) belonged to, when it still exists. */
+
 function survivingMain(clone: string): string | undefined {
   const match = /^(.*?)[\\/]\.?worktrees[\\/][^\\/]+/.exec(clone);
   return match && existsSync(join(match[1], '.git')) ? match[1] : undefined;
 }
 
-/** The main worktree of the repository `clone` belongs to; `clone` itself when git cannot say. */
+
 async function mainCheckout(git: GitRunner, clone: string): Promise<string> {
   const first = parseWorktrees(await git(['worktree', 'list', '--porcelain'], clone).catch(() => ''))[0]?.path;
   return first && existsSync(first) ? first : clone;

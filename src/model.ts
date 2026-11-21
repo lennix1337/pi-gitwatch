@@ -1,4 +1,4 @@
-/** GitHub pull-request state reduced to the fields that decide what to do next, and the transitions worth reporting. */
+
 import { localGate } from './local-gates.ts';
 
 export type ChecksState = 'none' | 'pending' | 'pass' | 'fail';
@@ -51,8 +51,9 @@ export interface Snapshot {
 /** The latest commit of a watched branch: its CI is reported once when it finishes, then the branch watch ends. */
 export interface BranchSnapshot { branch: string; head: string; headline: string; checks: Checks; reported: boolean }
 export type EventKind = 'opened' | 'merged' | 'closed' | 'reopened' | 'push' | 'checks' | 'mergeState' | 'review' | 'ready' | 'draft' | 'stall' | 'cleanup';
-/** `pr` is 0 for branch and watcher events; `branch` names the branch of a branch event. */
-/** `head` is the merged commit of a `merged` event's PR head, so local branches still pointing at it can be cleaned. */
+
+/** `pr` is 0 for branch and watcher events; `branch` names the branch of a branch event.
+ * `head` is the merged PR head commit, so local branches still pointing at it can be cleaned. */
 export interface WatchEvent {
   pr: number; branch?: string; kind: EventKind; text: string; wake: boolean; head?: string;
   /** A merge: the PR had auto-merge queued, so the merge was expected and may be reported quietly once nothing is left to do. */
@@ -62,9 +63,9 @@ export interface WatchEvent {
 interface RawContext {
   __typename?: string; name?: string; status?: string; conclusion?: string | null; context?: string; state?: string;
   detailsUrl?: string | null; targetUrl?: string | null;
-  /** A check run's node id: what a step-count request names it by. Not the run or the job of its details link. */
+
   id?: string;
-  /** When a check run started, or a commit status was created: the clock of a check that is still running. */
+
   startedAt?: string | null; createdAt?: string | null;
 }
 export interface RawCommit { oid: string; messageHeadline: string; statusCheckRollup: { contexts: { nodes: RawContext[] } } | null }
@@ -92,16 +93,16 @@ function verdict(c: RawContext): Verdict {
   return PASS.has(result) ? 'pass' : SKIP.has(result) ? 'skip' : 'fail';
 }
 
-/** The GitHub Actions run behind a check, from its details link. */
+
 const runId = (c: RawContext) => Number(/\/actions\/runs\/(\d+)/.exec(c.detailsUrl ?? c.targetUrl ?? '')?.[1]) || undefined;
 
-/** The Actions runs of the failed attempts of the failing checks, ascending. */
+
 function failedRuns(contexts: RawContext[], failing: string[]): number[] {
   const runs = contexts.filter(c => failing.includes(c.name ?? c.context ?? '?') && verdict(c) === 'fail').map(runId);
   return [...new Set(runs.filter((id): id is number => id !== undefined))].sort((a, b) => a - b);
 }
 
-/** The failing checks with the link to each one's job, one per name and link, in name order. */
+
 function failedJobs(contexts: RawContext[], failing: string[]): FailedJob[] {
   const jobs = new Map<string, FailedJob>();
   for (const c of contexts) {
@@ -117,9 +118,9 @@ function failedJobs(contexts: RawContext[], failing: string[]): FailedJob[] {
 /** The steps check runs executed, by node id, as far as they were read. */
 export type Steps = ReadonlyMap<string, number>;
 
-/** The failed runs of the failing checks. */
+
 const failedOf = (contexts: RawContext[], failing: string[]) => contexts.filter(c => failing.includes(c.name ?? c.context ?? '?') && verdict(c) === 'fail');
-/** A GitHub Actions job. A commit status or another app's check has no steps by nature: its failure means something did run. */
+// external: GitHub commit statuses and other apps check runs have no job steps.
 const isJob = (c: RawContext) => c.id !== undefined && runId(c) !== undefined;
 
 /** The check rollup of a pull request's head commit. */
@@ -158,7 +159,7 @@ export function summarizeChecks(contexts: RawContext[], steps?: Steps): Checks {
 /** The query reads this many check contexts per head; a full page may hide a required check that did report. */
 export const CONTEXTS_PAGE = 100;
 
-/** Required checks of the base with no context on the head, and the head's Actions runs to rerun. */
+
 function missingRequired(raw: RawPullRequest, contexts: RawContext[]): Pick<Snapshot, 'missingRequired' | 'headRuns'> {
   if (contexts.length >= CONTEXTS_PAGE) return {};
   const required = new Set(raw.baseRef?.branchProtectionRule?.requiredStatusCheckContexts ?? []);
@@ -201,7 +202,7 @@ const MERGE_STATE_TEXT: Record<string, string> = {
  */
 export function diff(prev: Snapshot | undefined, cur: Snapshot): WatchEvent[] {
   const pr = cur.number;
-  // A PR first seen already merged or closed has nothing to announce: it was not opened under this watch.
+
   if (!prev) return cur.state === 'OPEN' ? [{ pr, kind: 'opened', text: `opened by ${cur.author}`, wake: false }] : [];
   if (cur.state !== prev.state) {
     if (cur.state === 'MERGED') return [{ pr, kind: 'merged', text: `merged${cur.mergeCommit ? ` ${cur.mergeCommit}` : ''}`, wake: true, head: cur.head, ...prev.auto ? { auto: true as const } : {} }];
@@ -213,7 +214,7 @@ export function diff(prev: Snapshot | undefined, cur: Snapshot): WatchEvent[] {
   if (cur.head !== prev.head) events.push({ pr, kind: 'push', text: `new head ${cur.head}`, wake: false });
   const a = prev.checks, b = cur.checks;
   if (b.state !== a.state || (b.state === 'fail' && b.failing.join() !== a.failing.join())) {
-    // With auto-merge on, passing checks need nothing from the agent: the merge (or a stall) is what gets reported.
+
     if (b.state === 'pass') events.push({ pr, kind: 'checks', text: passedText(b), wake: !cur.auto });
     else if (b.state === 'fail') events.push({ pr, kind: 'checks', text: failedText(b), wake: b.pending === 0 || a.state !== 'fail' });
     else if (b.state === 'pending') events.push({ pr, kind: 'checks', text: `checks running (${b.pending} pending)`, wake: false });
@@ -228,7 +229,7 @@ export function diff(prev: Snapshot | undefined, cur: Snapshot): WatchEvent[] {
 }
 
 const passedText = (c: Checks) => `checks passed ${c.pass}/${c.pass + c.fail}${c.skipped ? `, ${c.skipped} skipped` : ''}`;
-/** Jobs that never started are failed checks to GitHub: the text opens as any failure does, then says what was observed. */
+
 const failedText = (c: Checks) => `checks failed: ${c.neverStarted ? 'never started (no step ran): ' : ''}${c.failing.join(', ')}`;
 
 /** How long auto-merge may sit on a PR whose checks passed before the agent is told it is stuck. */
@@ -274,11 +275,7 @@ export function branchDiff(prev: BranchSnapshot | undefined, cur: BranchSnapshot
   return { snapshot: { ...cur, reported }, events };
 }
 
-/**
- * The command that shows why a check failed: the Actions log when the run is known, else the PR checks. Jobs that never
- * started left no log (`--log-failed` answers "log not found"): what is left is validating `head` locally, and the run
- * page, which carries GitHub's reason as an annotation.
- */
+
 function failingLog(c: Checks, repo: string, head: string, pr?: number): string {
   if (c.neverStarted) {
     const gate = localGate(repo, head, pr);
@@ -304,7 +301,7 @@ export function branchHint(s: BranchSnapshot, repo: string): string | undefined 
   return s.checks.state === 'fail' && s.checks.pending === 0 ? failingLog(s.checks, repo, s.head) : undefined;
 }
 
-/** Titles longer than this are cut in a notice; the PR URL is the pointer to the rest. */
+
 const TITLE_CHARS = 60;
 
 /** One compact line per PR: the fields that decide the next action; the title's pointer when it was cut. */

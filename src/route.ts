@@ -14,7 +14,7 @@ export function confirmation(e: WatchEvent, cur: Snapshot): { slot: Slot; value:
   return undefined;
 }
 
-/** The slot a delivered PR event leaves behind, so the next identical confirmation is recognised as a repeat. */
+
 function slotOf(e: WatchEvent, cur: Snapshot): { slot: Slot; value: string } | undefined {
   if (e.kind === 'checks' && e.pr > 0 && e.branch === undefined) return { slot: 'checks', value: `${cur.checks.state}@${cur.head}` };
   if (e.kind === 'mergeState') return { slot: 'mergeState', value: `${cur.mergeState}@${cur.head}` };

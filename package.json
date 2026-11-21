@@ -22,7 +22,8 @@
     ]
   },
   "scripts": {
-    "check": "tsc --noEmit",
+    "check": "npm run lint:comments && tsc --noEmit",
+    "lint:comments": "node scripts/lint-comments.mjs",
     "verify": "npm run check && npm test",
     "test": "node --import tsx --test test/*.test.ts"
   },

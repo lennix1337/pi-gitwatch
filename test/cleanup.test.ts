@@ -7,7 +7,7 @@ import { gitRunner } from '../src/autowatch.ts';
 import { cleanMerged, cleanupLines } from '../src/cleanup.ts';
 import { tempDir } from './fixtures.ts';
 
-/** A real repository: `main`, a merged branch `done` (plain, and a clean worktree `wt-done`), a dirty worktree and later work. */
+
 function repo() {
   const dir = tempDir();
   const git = (...args: string[]) => execFileSync('git', args, { cwd: dir, encoding: 'utf8' }).trim();
@@ -22,7 +22,7 @@ function repo() {
   git('worktree', 'add', '-q', clean, 'wt-done');
   git('worktree', 'add', '-q', dirty, 'wt-dirty');
   writeFileSync(join(dirty, 'wip.txt'), 'uncommitted');
-  // `ahead` gained a commit after the PR merged: it no longer points at the head, so it is not touched.
+
   git('checkout', '-q', 'ahead');
   writeFileSync(join(dir, 'b.txt'), 'later'); git('add', 'b.txt'); git('commit', '-qm', 'later'); git('checkout', '-q', 'main');
   return { dir, head, clean, dirty, git };
@@ -52,7 +52,7 @@ test('the cleanup lines name the PR and are empty without a clone or merged even
   const { dir, head } = repo();
   assert.deepEqual(await cleanupLines(gitRunner, { events: [{ kind: 'merged', pr: 3, head }] }), []);
   assert.deepEqual(await cleanupLines(gitRunner, { clone: dir, events: [{ kind: 'checks', pr: 3, head }] }), []);
-  // Snapshots keep an 8-character head: git resolves the abbreviation.
+
   const lines = await cleanupLines(gitRunner, { clone: dir, events: [{ kind: 'merged', pr: 3, head: head.slice(0, 8) }] });
   assert.deepEqual(lines.map(l => l.pr), [3, 3, 3, 3]);
   assert.match(lines[0].text, /^removed branch done$/);

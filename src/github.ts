@@ -35,7 +35,7 @@ const literal = (s: string) => JSON.stringify(s);
 export function query(numbers: number[], open: boolean, branches: string[] = []): string {
   const parts = numbers.map(n => `p${n}: pullRequest(number: ${n}) { ...F }`);
   if (open) parts.push(`open: pullRequests(states: OPEN, first: ${MAX_PRS}, orderBy: { field: CREATED_AT, direction: ASC }) { nodes { ...F } }`);
-  // GitHub rejects a document that defines a fragment it never uses, as a branch-only query would.
+  // external: GitHub GraphQL rejects fragments that are declared but unused.
   const fragment = parts.length ? `\nfragment F on PullRequest { ${FIELDS} }` : '';
   branches.forEach((b, i) => parts.push(`b${i}: ref(qualifiedName: ${literal(`refs/heads/${b}`)}) { target { ... on Commit { oid messageHeadline ${ROLLUP} } } }`));
   return `query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { ${parts.join(' ')} } }${fragment}`;

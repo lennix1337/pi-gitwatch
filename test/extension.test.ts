@@ -9,21 +9,21 @@ import { Store } from '../src/watcher.ts';
 import { pendingFollows, requestFollow } from '../src/follow-requests.ts';
 import { commit, FakeGitHub, gitWorld, pr, run, tempDir } from './fixtures.ts';
 
-/** A quiet notice is appended to the session at once and starts no turn. A `nextTurn` message would be held until the operator's next message. */
+// external: Pi nextTurn messages wait for another operator message.
 const QUIET = { triggerTurn: false };
 
 type Handler = (event: unknown, ctx: { mode: string; cwd?: string; hasUI?: boolean; ui?: { notify: (text: string, type?: string) => void } }) => unknown;
-/** `git` answers the extension's git calls (default: a fake of o/r on main); `packages` are the loaded Pi packages (default: none, never the real settings). */
+
 function harness(mode = 'tui', dir = tempDir(), send?: () => void | Promise<void>, over: { git?: GitRunner; packages?: string[] } = {}) {
   const gh = new FakeGitHub();
   const handlers = new Map<string, Handler>();
   const sent: { message: { customType: string; content: string; display?: boolean }; options: unknown }[] = [];
   const timers: (() => void)[] = [];
   const warnings: string[] = [];
-  /** What the operator sees at once (ctx.ui.notify at 'info' level), in order with `sent`. */
+
   const shown: { text: string; sentBefore: number }[] = [];
   let tool: { execute: (...a: unknown[]) => Promise<{ content: { text: string }[]; isError?: boolean }> } | undefined;
-  // The shared extension bus: a subscriber listens on a channel and may take a notice it is addressed to.
+
   const bus = new Map<string, ((data: unknown) => void)[]>();
   const events = {
     emit: (channel: string, data: unknown) => { for (const h of bus.get(channel) ?? []) h(data); },
@@ -38,7 +38,7 @@ function harness(mode = 'tui', dir = tempDir(), send?: () => void | Promise<void
   extension(pi as never, { run: gh.run, git: over.git ?? (async args => args[0] === 'remote' ? 'https://github.com/o/r.git' : 'main'), packages: () => over.packages ?? [], store: new Store(dir), schedule: fn => { timers.push(fn); return timers.length; }, cancel: () => {} });
   handlers.get('session_start')!({}, { mode, hasUI: true, ui: { notify: (text, type) => { if (type === 'info') shown.push({ text, sentBefore: sent.length }); else warnings.push(text); } } });
   const call = (params: Record<string, unknown>) => tool!.execute('id', params, undefined, undefined, {});
-  /** Runs the scheduled poll and waits for it to settle. */
+
   const fire = async () => { const fn = timers.shift(); assert.ok(fn, 'a poll is scheduled'); await fn(); };
   return { gh, sent, timers, call, fire, handlers, dir, warnings, events, shown };
 }
@@ -247,14 +247,14 @@ test('a PR another process asks to follow (ship.mjs, a background shell) is foll
   assert.deepEqual(h.sent[0].options, { triggerTurn: true, deliverAs: 'steer' });
 });
 
-/** A repository `o/r` whose main checkout the agent leaves clean, and a feature branch checked out in a linked worktree, as scripts/ship.mjs leaves them. */
+
 function shipped() {
   const w = gitWorld();
   run(w.main, 'remote', 'set-url', 'origin', w.origin);
   const linked = join(w.main, '.worktrees', 'feat-x');
   run(w.main, 'worktree', 'add', '-q', '-b', 'feat/x', linked);
   const head = run(linked, 'rev-parse', 'HEAD');
-  // GitHub's squash merge lands on origin/main; the PR head is the branch commit.
+
   w.merge();
   const git: GitRunner = (args, cwd) => args[0] === 'remote' && args[1] === 'get-url' && cwd === w.main ? Promise.resolve('https://github.com/o/r.git') : gitRunner(args, cwd);
   return { ...w, linked, head, git };
@@ -437,7 +437,7 @@ test('a merge this session makes with gh pr merge is recorded from bash: its own
   assert.doesNotMatch(h.sent[0].message.content, /#100/);
 });
 
-/** Every payload a channel carried, in order. */
+
 const listen = <T>(h: { events: { on: (channel: string, fn: (data: unknown) => void) => unknown } }, channel: string) => {
   const seen: T[] = [];
   h.events.on(channel, data => seen.push(data as T));
@@ -574,7 +574,7 @@ test('a poll still running when the session reloads never touches the old sessio
   const h = harness();
   h.gh.set(pr(1));
   await h.call({ action: 'watch', repo: 'o/r' });
-  // Pi throws from ctx.ui once the session that gave the ctx was replaced or reloaded.
+  // external: Pi rejects UI calls to a context invalidated by session reload.
   let stale = false;
   const ctx = { mode: 'tui', hasUI: true, get ui() { if (stale) throw new Error('This extension ctx is stale'); return { notify: () => {} }; } };
   h.handlers.get('session_shutdown')!({}, { mode: 'tui' });
