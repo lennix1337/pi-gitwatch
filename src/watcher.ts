@@ -552,6 +552,7 @@ function advancePrs(watch: RepoWatch, snapshots: Map<number, Snapshot>, open: nu
       let announced: Announced | undefined = prev?.announced;
       const events = [...diff(prev, next), ...stall ? [stall] : []];
       for (const event of events) {
+        if (event.kind === 'merged' && next.base) followBaseFailuresAfterMerge(watch, next.base);
         const decision = routeEvent(event, { ownMerge: watch.ownMerges?.includes(n) ?? false, cur: next, announced });
         out.push({ event, decision });
         if (decision.route === 'respond') announced = announce(announced, event, next);
@@ -564,10 +565,18 @@ function advancePrs(watch: RepoWatch, snapshots: Map<number, Snapshot>, open: nu
 }
 
 
+function followBaseFailuresAfterMerge(watch: RepoWatch, base: string) {
+  const branches = watch.branches ??= {};
+  if (branches[base] || Object.keys(branches).length >= MAX_BRANCHES) return;
+  branches[base] = { branch: base, head: '', headline: '', reported: false, failOnly: true, checks: { state: 'none', pass: 0, fail: 0, pending: 0, skipped: 0, failing: [], runs: [], failedJobs: [] } };
+}
+
 function advanceBranches(watch: RepoWatch, branches: Map<string, BranchSnapshot>): Routed[] {
   const out: Routed[] = [];
   for (const [name, prev] of Object.entries(watch.branches ?? {})) {
     const cur = branches.get(name);
+    const notReadYet = !cur && prev.failOnly && !prev.head;
+    if (notReadYet) continue;
     if (!cur) { delete watch.branches![name]; continue; }
     const { snapshot, events } = branchDiff(prev, cur);
     watch.branches![name] = snapshot;

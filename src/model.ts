@@ -31,6 +31,8 @@ export interface Snapshot {
   review: string | null; head: string; auto: boolean; mergeCommit: string | null; checks: Checks;
   /** The head branch, so a notice names what to check out. Absent in snapshots saved before it was read. */
   branch?: string;
+  /** The base branch the PR merges into: after the merge its CI is followed and reported only if it fails. */
+  base?: string;
   /** The checks and merge state (with the head) the agent was last told about on this PR. */
   announced?: Announced;
   /** When checks were first seen passing on this head with auto-merge on, and whether the stall was reported. */
@@ -49,7 +51,11 @@ export interface Snapshot {
   headRuns?: number[];
 }
 /** The latest commit of a watched branch: its CI is reported once when it finishes, then the branch watch ends. */
-export interface BranchSnapshot { branch: string; head: string; headline: string; checks: Checks; reported: boolean }
+export interface BranchSnapshot {
+  branch: string; head: string; headline: string; checks: Checks; reported: boolean;
+  /** Followed after a PR merged into it: only a failure is news (a red base must not go unseen through later merges). */
+  failOnly?: boolean;
+}
 export type EventKind = 'opened' | 'merged' | 'closed' | 'reopened' | 'push' | 'checks' | 'mergeState' | 'review' | 'ready' | 'draft' | 'stall' | 'cleanup';
 
 /** `pr` is 0 for branch and watcher events; `branch` names the branch of a branch event.
@@ -71,7 +77,7 @@ interface RawContext {
 export interface RawCommit { oid: string; messageHeadline: string; statusCheckRollup: { contexts: { nodes: RawContext[] } } | null }
 export interface RawPullRequest {
   number: number; title: string; url: string; state: string; isDraft: boolean; mergeStateStatus: string; reviewDecision: string | null;
-  headRefOid: string; headRefName?: string; author: { login: string } | null; autoMergeRequest: unknown; mergeCommit: { oid: string } | null;
+  headRefOid: string; headRefName?: string; baseRefName?: string; author: { login: string } | null; autoMergeRequest: unknown; mergeCommit: { oid: string } | null;
   commits?: { nodes: { commit: { statusCheckRollup: { contexts: { nodes: RawContext[] } } | null } }[] };
   /** Required checks of the base: branch protection (null unless the viewer administers the repository) and rulesets. */
   baseRef?: {
@@ -178,6 +184,7 @@ export function normalize(raw: RawPullRequest, steps?: Steps): Snapshot {
     number: raw.number, title: raw.title, url: raw.url, author: raw.author?.login ?? 'ghost', state, draft: raw.isDraft,
     mergeState: raw.mergeStateStatus, review: raw.reviewDecision, head: raw.headRefOid.slice(0, 8), auto: raw.autoMergeRequest != null,
     ...raw.headRefName ? { branch: raw.headRefName } : {},
+    ...raw.baseRefName ? { base: raw.baseRefName } : {},
     mergeCommit: raw.mergeCommit?.oid.slice(0, 8) ?? null, checks: summarizeChecks(contexts, steps),
     ...missingRequired(raw, contexts),
   };
@@ -266,6 +273,11 @@ export function branchDiff(prev: BranchSnapshot | undefined, cur: BranchSnapshot
   const events: WatchEvent[] = [];
   const branch = cur.branch;
   const reported = prev.head === cur.head && prev.reported;
+  if (prev.failOnly) {
+    if (reported || !isFinal(cur.checks)) return { snapshot: { ...cur, reported, failOnly: true }, events };
+    const failed = cur.checks.state === 'fail';
+    return { snapshot: { ...cur, reported: true, failOnly: true }, events: failed ? [{ pr: 0, branch, kind: 'checks', text: `after the merge, ${failedText(cur.checks)} on ${cur.head}`, wake: true }] : [] };
+  }
   if (prev.head !== cur.head) events.push({ pr: 0, branch, kind: 'push', text: `new commit ${cur.head}`, wake: false });
   if (!reported && isFinal(cur.checks)) {
     const c = cur.checks;

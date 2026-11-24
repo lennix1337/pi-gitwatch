@@ -60,6 +60,27 @@ test('a new watch is a silent baseline; a finished check wakes once', async () =
   assert.equal((await watcher.poll()).notices.length, 0, 'the same state is not announced twice');
 });
 
+test('after a merge the base branch CI is followed and wakes only when it fails (Genexus18MCP main red through #1092-#1096)', async () => {
+  const { gh, watcher } = setup();
+  gh.set(pr(1, { baseRefName: 'main' }), pr(2, { baseRefName: 'main' }));
+  await watcher.watch('o/r', { prs: [1, 2] });
+  gh.set(pr(1, { baseRefName: 'main', state: 'MERGED', mergeCommit: { oid: 'abcdef123456' } }));
+  gh.branches.set('main', commit('abcdef123456', [['test', 'IN_PROGRESS']]));
+  await watcher.poll();
+  assert.ok(watcher.state().repos['o/r'].branches?.main, 'main is followed after the merge');
+  gh.branches.set('main', commit('abcdef123456', [['test', 'COMPLETED', 'FAILURE']], 55));
+  const red = await watcher.poll();
+  assert.match(red.notices.map(n => n.text).join('\n'), /main after the merge, checks failed: test on abcdef12/);
+  assert.equal(watcher.state().repos['o/r'].branches?.main, undefined, 'reported once, then dropped');
+
+  gh.set(pr(2, { baseRefName: 'main', state: 'MERGED', mergeCommit: { oid: 'bbbbbbbb1234' } }));
+  gh.branches.set('main', commit('bbbbbbbb1234'));
+  await watcher.poll();
+  const green = await watcher.poll();
+  assert.deepEqual(green.notices, [], 'a green base is silent');
+  assert.deepEqual(watcher.state().repos, {});
+});
+
 test('a merge is reported once and the PR is dropped; a list watch ends with its last PR', async () => {
   const { gh, watcher } = setup();
   gh.set(pr(1), pr(2));
@@ -628,7 +649,7 @@ test('state written before failing-job links existed loads, and its failing PR s
 });
 
 test('the GraphQL query asks for each PR head branch, so a notice can name it', () => {
-  assert.match(query([1], true), /headRefOid headRefName author/);
+  assert.match(query([1], true), /headRefOid headRefName baseRefName author/);
   assert.match(query([1], false), /headRefName/);
 });
 
