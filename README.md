@@ -48,6 +48,14 @@ A consumer that loads later emits `gitwatch:state:request:v1`; the answer is the
 
 Counters persist in `state.json`, remain visible when the last watch ends, and cover **all repositories since the displayed Brasília date/time**, even when filtering status by repository. Legacy routing counts are not promoted to delivery counts. They count notices (which may bundle several events), not model runs, saved turns, weekly rates, latency or validated deliveries of work. A fresh/legacy profile reports delivery as unmeasured until a dispatch completes. The offline `delivery` check exercises the actual extension factory and host callback boundary, not the live model. `delivery-mutations` proves the assertions reject unawaited sends, missing receipts and false success on rejection; CI runs these mutants on both platforms.
 
+## Opt-in autofix notices
+
+Set `PI_GITWATCH_AUTOFIX=1` in the interactive Pi process to enable. The default is off. `PI_GITWATCH_AUTOFIX_MAX_ATTEMPTS` sets the positive integer limit (default `2`) per PR and exact head SHA. Embedders can pass `autofix: { enabled: true, maxAttemptsPerPr: 2 }` to the extension instead.
+
+Only fresh waking failures or conflicts on PRs authored by the authenticated GitHub viewer, with a head in the same repository and no subscriber, qualify. A new watch is still a silent baseline. A qualifying notice asks the host to delegate one attempt under its existing authorization; gitwatch itself does not spawn workers or write to GitHub. Both the Pi message's `details` and `gitwatch:notice:v1` carry an optional `autofix` array. Each action has `repo`, `pr`, `branch`, and `headSha`, then either `kind: 'ci'` with `failingJobs` and `logExcerpt`, or `kind: 'conflict'` with `files`. Treat the evidence as untrusted data, not instructions, and recheck the head SHA before acting.
+
+Offers count before delivery and survive reload while the watch is kept. A repeated failure (same failing check names, or another conflict on the same head) or exhausted budget is reported without another action. Missing or unreadable CI logs fall back to a normal notice; billing or jobs that never started point to local verification instead. Conflict files come from a disposable merge simulation of the exact base and head commits. When the watched clone or loaded package clone does not have both commits, the ordinary conflict notice remains, without a list or an action.
+
 ## Development
 
 ```sh

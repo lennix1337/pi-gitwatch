@@ -33,6 +33,10 @@ export interface Snapshot {
   branch?: string;
   /** The base branch the PR merges into: after the merge its CI is followed and reported only if it fails. */
   base?: string;
+  /** Exact commits for an autofix candidate, only on the authenticated viewer's same-repo PRs. */
+  autofixHead?: string; autofixBase?: string;
+  /** Offered failure signatures by full head SHA, for the lifetime of this watch. */
+  autofixAttempts?: Record<string, string[]>;
   /** The checks and merge state (with the head) the agent was last told about on this PR. */
   announced?: Announced;
   /** When checks were first seen passing on this head with auto-merge on, and whether the stall was reported. */
@@ -78,6 +82,7 @@ export interface RawCommit { oid: string; messageHeadline: string; statusCheckRo
 export interface RawPullRequest {
   number: number; title: string; url: string; state: string; isDraft: boolean; mergeStateStatus: string; reviewDecision: string | null;
   headRefOid: string; headRefName?: string; baseRefName?: string; author: { login: string } | null; autoMergeRequest: unknown; mergeCommit: { oid: string } | null;
+  viewerDidAuthor?: boolean; isCrossRepository?: boolean; baseRefOid?: string;
   commits?: { nodes: { commit: { statusCheckRollup: { contexts: { nodes: RawContext[] } } | null } }[] };
   /** Required checks of the base: branch protection (null unless the viewer administers the repository) and rulesets. */
   baseRef?: {
@@ -185,6 +190,7 @@ export function normalize(raw: RawPullRequest, steps?: Steps): Snapshot {
     mergeState: raw.mergeStateStatus, review: raw.reviewDecision, head: raw.headRefOid.slice(0, 8), auto: raw.autoMergeRequest != null,
     ...raw.headRefName ? { branch: raw.headRefName } : {},
     ...raw.baseRefName ? { base: raw.baseRefName } : {},
+    ...raw.viewerDidAuthor === true && raw.isCrossRepository === false ? { autofixHead: raw.headRefOid, autofixBase: raw.baseRefOid } : {},
     mergeCommit: raw.mergeCommit?.oid.slice(0, 8) ?? null, checks: summarizeChecks(contexts, steps),
     ...missingRequired(raw, contexts),
   };
@@ -207,7 +213,7 @@ const MERGE_STATE_TEXT: Record<string, string> = {
  * A merge starts as a wake: the next step (pull, release, reload, cleanup) waits on it. The poll lowers it to a quiet
  * note (`handledMerge` in route.ts) only for an auto-merge whose local cleanup left nothing for the agent.
  */
-export function diff(prev: Snapshot | undefined, cur: Snapshot): WatchEvent[] {
+export function diff(prev: Snapshot | undefined, cur: Snapshot, autofixHeadChanged = false): WatchEvent[] {
   const pr = cur.number;
 
   if (!prev) return cur.state === 'OPEN' ? [{ pr, kind: 'opened', text: `opened by ${cur.author}`, wake: false }] : [];
@@ -220,13 +226,13 @@ export function diff(prev: Snapshot | undefined, cur: Snapshot): WatchEvent[] {
   const events: WatchEvent[] = [];
   if (cur.head !== prev.head) events.push({ pr, kind: 'push', text: `new head ${cur.head}`, wake: false });
   const a = prev.checks, b = cur.checks;
-  if (b.state !== a.state || (b.state === 'fail' && b.failing.join() !== a.failing.join())) {
+  if (b.state !== a.state || (b.state === 'fail' && (autofixHeadChanged || b.failing.join() !== a.failing.join()))) {
 
     if (b.state === 'pass') events.push({ pr, kind: 'checks', text: passedText(b), wake: !cur.auto });
     else if (b.state === 'fail') events.push({ pr, kind: 'checks', text: failedText(b), wake: b.pending === 0 || a.state !== 'fail' });
     else if (b.state === 'pending') events.push({ pr, kind: 'checks', text: `checks running (${b.pending} pending)`, wake: false });
   }
-  if (cur.mergeState !== prev.mergeState && cur.mergeState !== 'UNKNOWN') {
+  if ((cur.mergeState !== prev.mergeState && cur.mergeState !== 'UNKNOWN') || (autofixHeadChanged && cur.mergeState === 'DIRTY')) {
     const wake = cur.mergeState === 'DIRTY' || (cur.mergeState === 'BEHIND' && b.state !== 'pending') || (cur.mergeState === 'CLEAN' && !cur.auto && !cur.draft);
     events.push({ pr, kind: 'mergeState', text: MERGE_STATE_TEXT[cur.mergeState] ?? cur.mergeState, wake });
   }

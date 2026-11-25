@@ -2,6 +2,8 @@ import { readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
+import { autofixFromEnv, type AutofixOptions } from './autofix.ts';
+import { conflictingFiles } from './conflicts.ts';
 import { createdPrs, githubRepo, gitRunner, ownMerges, pushes, resolvePush, type GitRunner } from './autowatch.ts';
 import { cleanupLines } from './cleanup.ts';
 import { loadedPackages, packageClone } from './packages.ts';
@@ -39,6 +41,7 @@ const LOOP_MOVES: Record<Loop['phase'], Loop['phase'][]> = { stopped: ['waiting'
 
 export interface Options {
   run?: Runner; git?: GitRunner; store?: Store; now?: () => number;
+  autofix?: AutofixOptions;
   schedule?: (fn: () => void, ms: number) => { unref?(): void } | unknown; cancel?: (handle: unknown) => void;
   /** The folders of the loaded Pi packages; by default read from the Pi settings file at each use. */
   packages?: () => string[];
@@ -73,6 +76,7 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
   const now = options.now ?? Date.now;
   const watcher = new Watcher(store, options.run ?? ghRunner, now);
   const git = options.git ?? gitRunner;
+  const autofix = options.autofix ?? autofixFromEnv();
   const lease = new Lease(store.dir);
   const schedule = options.schedule ?? ((fn: () => void, ms: number) => setTimeout(fn, ms));
   const cancel = options.cancel ?? ((h: unknown) => clearTimeout(h as NodeJS.Timeout));
@@ -104,6 +108,10 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
   /** Local cleanup of merged PRs: its lines are reported with the merge, in the same poll. */
   const packages = options.packages ?? (() => loadedPackages());
   const cleanup = (notice: { clone: string; events: Notice['events'] }) => cleanupLines(git, notice, { packages: packages() });
+  const conflicts = async (repo: string, head: string, base: string, clone?: string) => {
+    const local = clone ?? await packageClone(repo, packages(), git);
+    return local ? conflictingFiles(git, local, head, base) : [];
+  };
 
   /**
    * A notice of a subscriber goes on the event bus first; a consumer that accepts it owns it. Otherwise (no consumer, or
@@ -127,7 +135,7 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
     publish(STATE_CHANNEL, lastState);
   };
   const publishNotice = (notice: Notice) => {
-    const live: LiveNotice = { repo: notice.repo, wake: notice.wake, text: notice.text, at: now(), events: notice.events, ...notice.subscriber ? { subscriber: notice.subscriber } : {} };
+    const live: LiveNotice = { repo: notice.repo, wake: notice.wake, text: notice.text, at: now(), events: notice.events, ...notice.subscriber ? { subscriber: notice.subscriber } : {}, ...notice.autofix ? { autofix: notice.autofix } : {} };
     publish(NOTICE_CHANNEL, live);
   };
 
@@ -143,7 +151,7 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
     try {
       // external: never `deliverAs: 'nextTurn'` for a quiet notice; Pi holds those until the operator writes again.
       await pi.sendMessage(
-        { customType: MESSAGE_TYPE, content: text, display: true, details: { repo: notice.repo, events: notice.events } },
+        { customType: MESSAGE_TYPE, content: text, display: true, details: { repo: notice.repo, events: notice.events, ...notice.autofix ? { autofix: notice.autofix } : {} } },
         notice.wake ? { triggerTurn: true, deliverAs: 'steer' } : { triggerTurn: false },
       );
       accepted = true;
@@ -176,7 +184,7 @@ export default function extension(pi: ExtensionAPI, options: Options = {}) {
             warn?.(`Gitwatch: could not follow ${request.repo} #${request.pr} asked by another process (${message.split('\n')[0]}).`);
           }
         }
-        const { notices } = await watcher.poll(undefined, undefined, { cleanup });
+        const { notices } = await watcher.poll(undefined, undefined, { cleanup, autofix, conflicts });
         publishState();
         for (const n of notices) { if (mine !== epoch) break; await deliver(n); }
       }

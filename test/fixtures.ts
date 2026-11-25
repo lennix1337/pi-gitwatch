@@ -60,6 +60,7 @@ export class FakeGitHub {
   /** Steps each check run executed, by its node id. An id not listed here comes back as a null node. */
   steps = new Map<string, number>();
   calls: string[][] = [];
+  logs = new Map<number, string | Error>();
   fail?: string;
   /** Holds every request until it settles, to act while a poll is in flight. */
   hold?: Promise<void>;
@@ -70,6 +71,11 @@ export class FakeGitHub {
     this.calls.push(args);
     await this.hold;
     if (this.fail) throw new Error(this.fail);
+    if (args[0] === 'run' && args[1] === 'view' && args.includes('--log-failed')) {
+      const log = this.logs.get(Number(args[2]));
+      if (log instanceof Error) throw log;
+      return log ?? '';
+    }
     const query = args[args.indexOf('-f') + 1];
     const ids = /nodes\(ids: \[(.*?)\]\)/.exec(query)?.[1];
     if (ids !== undefined) {
