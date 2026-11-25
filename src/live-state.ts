@@ -1,4 +1,5 @@
 import { hint, type BranchSnapshot, type Checks, type Snapshot, type WatchEvent } from './model.ts';
+import type { AutofixAction } from './autofix.ts';
 import type { State } from './watcher.ts';
 
 /**
@@ -23,7 +24,7 @@ export interface LivePr {
 export interface LiveBranch { repo: string; branch: string; head: string; checks: LiveChecks; pendingSince: number | null }
 export interface LiveRepo { repo: string; mode: 'open' | 'list'; prs: LivePr[]; branches: LiveBranch[]; lastError?: string }
 export interface LiveState { version: 1; polledAt: number; repos: LiveRepo[] }
-export interface LiveNotice { repo: string; wake: boolean; text: string; at: number; events: WatchEvent[]; subscriber?: string }
+export interface LiveNotice { repo: string; wake: boolean; text: string; at: number; events: WatchEvent[]; subscriber?: string; autofix?: AutofixAction[] }
 
 const checksOf = ({ pass, fail, pending }: Checks): LiveChecks => ({ pass, fail, pending });
 const pendingSince = (c: Checks) => (c.pending > 0 ? c.pendingSince ?? null : null);

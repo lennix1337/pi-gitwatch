@@ -42,6 +42,24 @@ test('a state file with a missing or unknown watch shape is repaired on load so 
   assert.equal(notices.length, 1, 'the third failure in a row is announced');
 });
 
+test('autofix wakes for the same red jobs on a new exact head, but not for an unchanged poll', async () => {
+  const { watcher, gh } = setup();
+  const own = { viewerDidAuthor: true, isCrossRepository: false, headRefName: 'feat/test' };
+  const jobs = jobsOf([{ id: 'CR_test', name: 'test', conclusion: 'FAILURE', run: 42, job: 1 }]);
+  gh.steps.set('CR_test', 1);
+  gh.logs.set(42, 'AssertionError');
+  gh.set(pr(1, { ...own, commits: jobs }));
+  await watcher.watch('o/r', { prs: [1] });
+  const options = { autofix: { enabled: true } };
+  assert.equal((await watcher.poll(undefined, undefined, options)).notices.length, 0);
+  const headRefOid = `${'1'.padEnd(8, 'a')}${'b'.repeat(32)}`;
+  gh.set(pr(1, { ...own, commits: jobs, headRefOid }));
+  const { notices } = await watcher.poll(undefined, undefined, options);
+  assert.equal(notices.length, 1);
+  assert.equal(notices[0].autofix?.[0].headSha, headRefOid);
+  assert.equal((await watcher.poll(undefined, undefined, options)).notices.length, 0);
+});
+
 test('a new watch is a silent baseline; a finished check wakes once', async () => {
   const { gh, watcher } = setup();
   gh.set(pr(750, {}, [['test', 'IN_PROGRESS']]), pr(751, { mergeStateStatus: 'DIRTY' }));

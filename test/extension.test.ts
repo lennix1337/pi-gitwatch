@@ -4,20 +4,21 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import extension, { Lease, MESSAGE_TYPE } from '../src/index.ts';
 import { SUBSCRIBER_NOTICE_CHANNEL, type SubscriberNotice } from '../src/subscribers.ts';
+import { NOTICE_CHANNEL } from '../src/live-state.ts';
 import { gitRunner, type GitRunner } from '../src/autowatch.ts';
 import { Store } from '../src/watcher.ts';
 import { pendingFollows, requestFollow } from '../src/follow-requests.ts';
-import { commit, FakeGitHub, gitWorld, pr, run, tempDir } from './fixtures.ts';
+import { commit, FakeGitHub, gitWorld, jobsOf, pr, run, tempDir } from './fixtures.ts';
 
 // external: Pi nextTurn messages wait for another operator message.
 const QUIET = { triggerTurn: false };
 
 type Handler = (event: unknown, ctx: { mode: string; cwd?: string; hasUI?: boolean; ui?: { notify: (text: string, type?: string) => void } }) => unknown;
 
-function harness(mode = 'tui', dir = tempDir(), send?: () => void | Promise<void>, over: { git?: GitRunner; packages?: string[] } = {}) {
+function harness(mode = 'tui', dir = tempDir(), send?: () => void | Promise<void>, over: { git?: GitRunner; packages?: string[]; autofix?: { enabled: boolean; maxAttemptsPerPr?: number } } = {}) {
   const gh = new FakeGitHub();
   const handlers = new Map<string, Handler>();
-  const sent: { message: { customType: string; content: string; display?: boolean }; options: unknown }[] = [];
+  const sent: { message: { customType: string; content: string; display?: boolean; details?: { autofix?: unknown } }; options: unknown }[] = [];
   const timers: (() => void)[] = [];
   const warnings: string[] = [];
 
@@ -35,7 +36,7 @@ function harness(mode = 'tui', dir = tempDir(), send?: () => void | Promise<void
     sendMessage: (message: { customType: string; content: string }, options: unknown) => { sent.push({ message, options }); return send?.(); },
     events,
   };
-  extension(pi as never, { run: gh.run, git: over.git ?? (async args => args[0] === 'remote' ? 'https://github.com/o/r.git' : 'main'), packages: () => over.packages ?? [], store: new Store(dir), schedule: fn => { timers.push(fn); return timers.length; }, cancel: () => {} });
+  extension(pi as never, { autofix: over.autofix, run: gh.run, git: over.git ?? (async args => args[0] === 'remote' ? 'https://github.com/o/r.git' : 'main'), packages: () => over.packages ?? [], store: new Store(dir), schedule: fn => { timers.push(fn); return timers.length; }, cancel: () => {} });
   handlers.get('session_start')!({}, { mode, hasUI: true, ui: { notify: (text, type) => { if (type === 'info') shown.push({ text, sentBefore: sent.length }); else warnings.push(text); } } });
   const call = (params: Record<string, unknown>) => tool!.execute('id', params, undefined, undefined, {});
 
@@ -56,6 +57,142 @@ test('a watched PR whose checks finish wakes the session with a steer message', 
   assert.match(h.sent[0].message.content, /#750 checks passed 1\/1; mergeable \(CLEAN\)[\s\S]*next: ready to merge/);
   assert.deepEqual(h.sent[0].options, { triggerTurn: true, deliverAs: 'steer' });
   assert.equal(h.timers.length, 1, 'polling continues');
+});
+
+const ownHead = { viewerDidAuthor: true, isCrossRepository: false, headRefName: 'feat/test' };
+const failedCI = (head = ownHead, name = 'test') => pr(1, { ...head, commits: jobsOf([{ id: 'CR_1', name, conclusion: 'FAILURE', run: 42, job: 1 }]) });
+const pendingCI = (head = ownHead) => pr(1, head, [['test', 'IN_PROGRESS']]);
+const startCI = async (h: ReturnType<typeof harness>, head = ownHead, subscriber?: string) => {
+  h.gh.set(pendingCI(head));
+  const reply = await h.call({ action: 'watch', repo: 'o/r', prs: [1], ...subscriber ? { subscriber } : {} });
+  assert.equal(reply.isError, undefined);
+  h.gh.steps.set('CR_1', 1);
+};
+const logReads = (h: ReturnType<typeof harness>) => h.gh.calls.filter(args => args[0] === 'run');
+
+test('autofix sends bounded CI evidence through the host wake and notice bus', async () => {
+  const h = harness('tui', tempDir(), undefined, { autofix: { enabled: true } });
+  const notices: { autofix?: unknown }[] = [];
+  h.events.on(NOTICE_CHANNEL, n => notices.push(n as typeof notices[number]));
+  await startCI(h);
+  h.gh.logs.set(42, `test\tunit\tAssertionError: expected 2\n${'next line\n'.repeat(30)}NOT FIRST LINES`);
+  h.gh.set(failedCI());
+  await h.fire();
+  const expected = [{ repo: 'o/r', pr: 1, branch: 'feat/test', headSha: '1'.padEnd(40, 'a'), kind: 'ci', failingJobs: ['test'], logExcerpt: `test\tunit\tAssertionError: expected 2\n${'next line\n'.repeat(11).trimEnd()}` }];
+  assert.deepEqual(logReads(h), [['run', 'view', '42', '--repo', 'o/r', '--log-failed']]);
+  assert.deepEqual(h.sent[0].message.details?.autofix, expected);
+  assert.deepEqual(notices[0].autofix, expected);
+  assert.match(h.sent[0].message.content, /delegate one fix attempt/i);
+  assert.deepEqual(h.sent[0].options, { triggerTurn: true, deliverAs: 'steer' });
+});
+
+test('autofix recognizes billing failures in returned logs and gh errors, and points to local verification', async () => {
+  const billing = 'The job was not started because recent account payments have failed.';
+  for (const evidence of [billing, new Error(billing), undefined]) {
+    const h = harness('tui', tempDir(), undefined, { autofix: { enabled: true } });
+    await startCI(h);
+    if (evidence === undefined) h.gh.steps.set('CR_1', 0);
+    else h.gh.logs.set(42, evidence);
+    h.gh.set(failedCI());
+    await h.fire();
+    assert.equal(h.sent.length, 1);
+    assert.equal(h.sent[0].message.details?.autofix, undefined);
+    assert.match(h.sent[0].message.content, /run local verify instead/i);
+    assert.equal(logReads(h).length, evidence === undefined ? 0 : 1);
+  }
+});
+
+test('autofix does not spend an attempt when a log read fails', async () => {
+  const h = harness('tui', tempDir(), undefined, { autofix: { enabled: true, maxAttemptsPerPr: 1 } });
+  await startCI(h);
+  h.gh.logs.set(42, new Error('HTTP 502'));
+  h.gh.set(failedCI());
+  await h.fire();
+  assert.equal(h.sent[0].message.details?.autofix, undefined);
+  assert.match(h.sent[0].message.content, /no complete CI log evidence; run local verify instead/);
+  h.gh.set(pendingCI());
+  await h.fire();
+  h.gh.logs.set(42, 'failed assertion');
+  h.gh.set(failedCI());
+  await h.fire();
+  assert.ok(h.sent[1].message.details?.autofix);
+});
+
+test('autofix escalates repeat CI on the same head and caps distinct attempts across restart', async () => {
+  const dir = tempDir();
+  const over = { autofix: { enabled: true, maxAttemptsPerPr: 2 } };
+  const h = harness('tui', dir, undefined, over);
+  await startCI(h);
+  h.gh.logs.set(42, 'failed assertion');
+  h.gh.set(failedCI());
+  await h.fire();
+  assert.ok(h.sent[0].message.details?.autofix);
+  await h.fire();
+  assert.equal(h.sent.length, 1, 'an unchanged red poll is silent');
+  h.gh.set(pendingCI());
+  await h.fire();
+  h.handlers.get('session_shutdown')!({}, { mode: 'tui' });
+  const resumed = harness('tui', dir, undefined, over);
+  resumed.gh.steps.set('CR_1', 1);
+  resumed.gh.logs.set(42, 'failed assertion');
+  resumed.gh.set(failedCI());
+  await resumed.fire();
+  assert.equal(resumed.sent[0].message.details?.autofix, undefined);
+  assert.match(resumed.sent[0].message.content, /autofix escalated.*same failure/i);
+  resumed.gh.set(failedCI(ownHead, 'lint'));
+  await resumed.fire();
+  assert.ok(resumed.sent[1].message.details?.autofix);
+  resumed.gh.set(failedCI(ownHead, 'build'));
+  await resumed.fire();
+  assert.equal(resumed.sent[2].message.details?.autofix, undefined);
+  assert.match(resumed.sent[2].message.content, /autofix escalated.*attempt limit/i);
+  const newHead = { ...ownHead, headRefOid: `${'1'.padEnd(8, 'a')}${'b'.repeat(32)}` };
+  resumed.gh.set(failedCI(newHead, 'build'));
+  await resumed.fire();
+  assert.ok(resumed.sent[3].message.details?.autofix, 'a new full SHA gets its own budget');
+});
+
+test('autofix includes actual conflict paths at the advertised SHAs without changing the checkout', async () => {
+  const { main } = gitWorld();
+  run(main, 'switch', '-qc', 'feat/test');
+  writeFileSync(join(main, 'a.txt'), 'head change\n');
+  run(main, 'commit', '-qam', 'head');
+  const headRefOid = run(main, 'rev-parse', 'HEAD');
+  run(main, 'switch', '-q', 'main');
+  writeFileSync(join(main, 'a.txt'), 'base change\n');
+  run(main, 'commit', '-qam', 'base');
+  const baseRefOid = run(main, 'rev-parse', 'HEAD');
+  writeFileSync(join(main, 'a.txt'), 'local uncommitted edit\n');
+  const h = harness('tui', tempDir(), undefined, { autofix: { enabled: true }, git: gitRunner });
+  const head = { ...ownHead, headRefOid, baseRefOid };
+  await startCI(h, head);
+  const store = new Store(h.dir), state = store.load();
+  state.repos['o/r'].clone = main;
+  store.save(state);
+  h.gh.set(pr(1, { ...head, mergeStateStatus: 'DIRTY' }, [['test', 'IN_PROGRESS']]));
+  await h.fire();
+  assert.deepEqual(h.sent[0].message.details?.autofix, [{ repo: 'o/r', pr: 1, branch: 'feat/test', headSha: headRefOid, kind: 'conflict', files: ['a.txt'] }]);
+  assert.equal(run(main, 'rev-parse', 'HEAD'), baseRefOid);
+  assert.equal(readFileSync(join(main, 'a.txt'), 'utf8'), 'local uncommitted edit\n');
+  assert.equal(logReads(h).length, 0);
+});
+
+test('autofix leaves disabled, foreign, fork and subscriber notices on their original route', async () => {
+  for (const [enabled, head, subscriber] of [
+    [false, ownHead, undefined], [true, { ...ownHead, viewerDidAuthor: false }, undefined],
+    [true, { ...ownHead, isCrossRepository: true }, undefined], [true, ownHead, 'worker'],
+  ] as const) {
+    const h = harness('tui', tempDir(), undefined, { autofix: { enabled } });
+    await startCI(h, head, subscriber);
+    h.gh.logs.set(42, 'failed assertion');
+    h.gh.set(failedCI(head));
+    await h.fire();
+    assert.equal(h.sent.length, 1);
+    assert.equal(h.sent[0].message.details?.autofix, undefined);
+    assert.match(h.sent[0].message.content, /#1 checks failed: test/);
+    assert.equal(logReads(h).length, 0);
+    assert.equal(h.sent[0].message.content.includes('no subscriber accepted it'), Boolean(subscriber));
+  }
 });
 
 test('delivery waits for host acceptance before recording it or scheduling another poll', async () => {

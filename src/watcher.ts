@@ -1,6 +1,7 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { planAutofix, type AutofixAction, type AutofixOptions, type ConflictFiles } from './autofix.ts';
 import type { CleanupLine } from './cleanup.ts';
 import { fetchRepo, fetchSteps, lookupPush, MAX_BRANCHES, MAX_PRS, type Runner } from './github.ts';
 import {
@@ -47,10 +48,12 @@ export interface DeliveryStats {
 }
 export interface State { version: 1; intervalSec: number; repos: Record<string, RepoWatch>; stats?: Stats; deliveries?: DeliveryStats; routes?: Routes }
 /** `wake: false` is recorded for the agent's next turn without starting one. `subscriber` names who takes it, if not this session. */
-export interface Notice { repo: string; events: WatchEvent[]; text: string; wake: boolean; clone?: string; subscriber?: string }
+export interface Notice { repo: string; events: WatchEvent[]; text: string; wake: boolean; clone?: string; subscriber?: string; autofix?: AutofixAction[] }
 export interface PollOptions {
   /** `false`: the caller shows the changes itself (status), so nothing is held or returned as a notice. */
   deliver?: boolean;
+  autofix?: AutofixOptions;
+  conflicts?: ConflictFiles;
   /** Local cleanup of the merged PRs in the clone the agent pushed from; its results are reported with the merge. */
   cleanup?: (notice: { clone: string; events: WatchEvent[] }) => Promise<CleanupLine[]>;
 }
@@ -107,6 +110,9 @@ function repair(state: State) {
     // external: Older saved state predates failing-job links.
     for (const s of [...Object.values(watch.snapshots), ...Object.values(watch.branches ?? {})]) {
       if (s.checks && !Array.isArray(s.checks.failedJobs)) s.checks.failedJobs = [];
+    }
+    for (const s of Object.values(watch.snapshots)) {
+      if (s.autofixAttempts && (!isPlainObject(s.autofixAttempts) || Object.values(s.autofixAttempts).some(v => !Array.isArray(v) || v.some(i => typeof i !== 'string')))) delete s.autofixAttempts;
     }
   }
 }
@@ -207,6 +213,31 @@ function planNotices(repo: string, watch: RepoWatch, routed: Routed[], cleanups:
     });
   }
   return { notices, held };
+}
+
+async function attachAutofix(notices: Notice[], routed: Routed[], shown: Map<number, Snapshot>, run: Runner,
+  options: AutofixOptions, conflicts?: ConflictFiles, signal?: AbortSignal) {
+  const notice = notices.find(n => n.wake && !n.subscriber);
+  if (!notice) return;
+  const events = new Map<number, WatchEvent[]>();
+  for (const { event, decision } of routed) {
+    if (event.pr > 0 && decision.route === 'respond' && notice.events.includes(event)) {
+      events.set(event.pr, [...events.get(event.pr) ?? [], event]);
+    }
+  }
+  const notes: string[] = [];
+  for (const [pr, fresh] of events) {
+    const snapshot = shown.get(pr);
+    if (!snapshot) continue;
+    const result = await planAutofix(notice.repo, snapshot, fresh, run, options, conflicts, notice.clone, signal);
+    if (!result) continue;
+    notes.push(result.note);
+    if (result.action) (notice.autofix ??= []).push(result.action);
+  }
+  if (notes.length) {
+    const at = notice.text.indexOf('\n');
+    notice.text = `${notice.text.slice(0, at)}\n${notes.join('\n')}${notice.text.slice(at)}`;
+  }
 }
 
 export class Watcher {
@@ -330,7 +361,7 @@ export class Watcher {
       for (const [index, [repo, watch]] of watched.entries()) {
         try {
           const { snapshots, open, branches } = settledValue(fetched[index]);
-          const routed = [...advancePrs(watch, snapshots, open, this.now()), ...advanceBranches(watch, branches)];
+          const routed = [...advancePrs(watch, snapshots, open, this.now(), deliver && options.autofix?.enabled === true), ...advanceBranches(watch, branches)];
           if (watch.failures >= noticeAfter(watch.lastError)) routed.push({ event: { pr: 0, kind: 'checks', text: `polling recovered after ${watch.failures} failures`, wake: false }, decision: { route: 'candidate', reason: 'quiet' } });
           watch.failures = 0; delete watch.lastError; watch.lastPoll = this.now();
           const shown = new Map(Object.values(watch.snapshots).map(s => [s.number, s]));
@@ -346,6 +377,7 @@ export class Watcher {
           if (deliver) {
             watch.held = Object.keys(planned.held).length ? planned.held : undefined;
             if (!watch.held) delete watch.held;
+            if (options.autofix?.enabled) await attachAutofix(planned.notices, routed, shown, this.run, options.autofix, options.conflicts, signal);
             notices.push(...planned.notices);
           }
           this.prune(watch, true);
@@ -430,11 +462,11 @@ export class Watcher {
 }
 
 
-interface Head { head: string; checks: Checks }
+interface Head { head: string; checks: Checks; autofixHead?: string }
 
 
 const sameFailure = (stored: Head | undefined, read: Head): stored is Head =>
-  stored !== undefined && stored.head === read.head && stored.checks.state === 'fail' && read.checks.state === 'fail' && stored.checks.failing.join() === read.checks.failing.join();
+  stored !== undefined && (stored.autofixHead ?? stored.head) === (read.autofixHead ?? read.head) && stored.checks.state === 'fail' && read.checks.state === 'fail' && stored.checks.failing.join() === read.checks.failing.join();
 
 
 interface Reading<S extends Head> { stored: S | undefined; plain: S; ask: string[] | undefined; build: (steps: Steps) => S }
@@ -506,6 +538,7 @@ const keepTracked = (next: Snapshot, prev: Snapshot | undefined): Snapshot => {
   return {
     ...next,
     ...prev.announced ? { announced: prev.announced } : {},
+    ...prev.autofixAttempts ? { autofixAttempts: prev.autofixAttempts } : {},
     ...sameHead ? { passedAt: prev.passedAt, stallReported: prev.stallReported } : {},
   };
 };
@@ -537,7 +570,7 @@ function nextWatch(existing: RepoWatch | undefined, { prs, branch }: WatchReques
 interface Routed { event: WatchEvent; decision: Decision }
 
 
-function advancePrs(watch: RepoWatch, snapshots: Map<number, Snapshot>, open: number[] | undefined, now: number): Routed[] {
+function advancePrs(watch: RepoWatch, snapshots: Map<number, Snapshot>, open: number[] | undefined, now: number, autofixEnabled: boolean): Routed[] {
   const out: Routed[] = [];
   for (const n of new Set([...Object.keys(watch.snapshots).map(Number), ...watch.prs, ...open ?? []])) {
     const cur = snapshots.get(n);
@@ -550,7 +583,9 @@ function advancePrs(watch: RepoWatch, snapshots: Map<number, Snapshot>, open: nu
     let next = snapshot;
     if (prev || watch.mode === 'open') {
       let announced: Announced | undefined = prev?.announced;
-      const events = [...diff(prev, next), ...stall ? [stall] : []];
+      const autofixHeadChanged = autofixEnabled && !!prev?.autofixHead && !!next.autofixHead &&
+        prev.autofixHead !== next.autofixHead && !watch.subscribers?.[`pr:${n}`];
+      const events = [...diff(prev, next, autofixHeadChanged), ...stall ? [stall] : []];
       for (const event of events) {
         if (event.kind === 'merged' && next.base) followBaseFailuresAfterMerge(watch, next.base);
         const decision = routeEvent(event, { ownMerge: watch.ownMerges?.includes(n) ?? false, cur: next, announced });
@@ -559,6 +594,7 @@ function advancePrs(watch: RepoWatch, snapshots: Map<number, Snapshot>, open: nu
       }
       if (announced) next = { ...next, announced };
     }
+    if (prev?.autofixAttempts) next.autofixAttempts = prev.autofixAttempts;
     watch.snapshots[n] = next;
   }
   return out;
